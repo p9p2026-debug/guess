@@ -1,0 +1,12 @@
+[project]
+name = "telegram-photo-guess-game"
+version = "0.1.0"
+description = "A Telegram photo-guessing party game bot (Hedbanz/Heads Up style)."
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "."]
+pythonpath = ["."]
+python_files = ["test_*.py", "_smoke_*.py"]
+
+
