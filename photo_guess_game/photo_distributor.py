@@ -10,23 +10,24 @@ Adapter's responsibility.
 
 from __future__ import annotations
 
-import time
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace
+from time import monotonic
 
-from .models import GameSession, GameState, OperationResult, Notification
-from .session_store import SessionStore
+from .callback_codec import encode_callback
+from .models import (
+    GameSession,
+    GameState,
+    Notification,
+    OperationResult,
+    RoundPhase,
+    SessionKey,
+)
+from .session_store import SessionStore, StoreView
 
 
 def _label_for_index(index: int) -> str:
-    """Return the Label assigned to the Player at ``index`` in join order.
-
-    Uses a fixed, join-order-based scheme (``"Photo A"``, ``"Photo B"``,
-    ...) so the Label a given Photo_Submission receives depends only on
-    the Player's position in the session's join order, not on the
-    recipient or any other identity-bearing data (Req 5.4). Extends
-    naturally past 26 Players (``"Photo AA"``, ``"Photo AB"``, ...) even
-    though ``Maximum_Players`` defaults to 15.
-    """
+    """Return the Label assigned to the Player at ``index`` in join order."""
     letters = ""
     n = index
     while True:
@@ -39,92 +40,129 @@ def _label_for_index(index: int) -> str:
 
 @dataclass
 class DisambiguationRequired(OperationResult):
-    """An ``OperationResult`` subtype returned when a photo needs a choice.
-
-    Carries the candidate ``group_chat_id``s (sorted) alongside the usual
-    ``notifications`` prompt so the Telegram Adapter can render selectable
-    options for the Player rather than parse them out of the prompt text
-    (Req 11.3). ``resolve_disambiguated_submission`` validates the Player's
-    reply against exactly these candidates.
-    """
+    """A pending choice whose candidates retain exact generation identity."""
 
     candidate_group_chat_ids: tuple[int, ...] = ()
+    candidate_session_keys: tuple[SessionKey, ...] = ()
 
 
-@dataclass
-class _PendingSubmission:
-    """A photo held while the Player resolves which session it belongs to.
+@dataclass(frozen=True, slots=True)
+class PendingDMContext:
+    """One bounded-lifetime private payload awaiting an explicit group choice."""
 
-    Mirrors the design's "Pending photo (disambiguation)" data model:
-    ``{user_id: (file_id, candidate_group_chat_ids, received_at)}``. Held
-    only while a Req 11.3 disambiguation is outstanding.
-    """
-
+    context_id: int
+    user_id: int
     file_id: str
-    candidate_group_chat_ids: frozenset[int]
-    received_at: float
+    candidate_session_keys: frozenset[SessionKey]
+    expires_at: float
+
+
+@dataclass(frozen=True, slots=True)
+class PendingDMResolution:
+    """Pure resolution result; it cannot mutate a session until committed."""
+
+    ok: bool
+    reason: str | None
+    context_id: int | None = None
+    user_id: int | None = None
+    file_id: str | None = None
+    session_key: SessionKey | None = None
+    expires_at: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedPhotoSubmission:
+    """Pure DM routing decision; session mutation still requires StoreView."""
+
+    result: OperationResult
+    session_key: SessionKey | None = None
+    user_id: int | None = None
+    file_id: str | None = None
 
 
 class PhotoDistributor:
-    """Stores Photo_Submissions and builds per-Player distribution payloads."""
+    """Stores photos and owns generation-safe pending DM contexts."""
 
-    def __init__(self, store: SessionStore) -> None:
+    def __init__(
+        self,
+        store: SessionStore,
+        *,
+        clock: Callable[[], float] = monotonic,
+        pending_ttl_seconds: float = 300.0,
+        cleanup_batch_limit: int = 100,
+    ) -> None:
+        if pending_ttl_seconds <= 0:
+            raise ValueError("pending_ttl_seconds must be positive")
+        if cleanup_batch_limit <= 0:
+            raise ValueError("cleanup_batch_limit must be positive")
         self._store = store
-        # Short-lived cache of photos awaiting a disambiguation reply,
-        # keyed by user_id (Req 11.3). Entries are cleared once resolved.
-        self._pending: dict[int, _PendingSubmission] = {}
+        self._clock = clock
+        self._pending_ttl_seconds = pending_ttl_seconds
+        self._cleanup_batch_limit = cleanup_batch_limit
+        self._pending: dict[int, PendingDMContext] = {}
+        self._next_context_id = 1
 
-    def submit_photo(self, user_id: int, file_id: str) -> OperationResult:
-        """Store ``file_id`` as ``user_id``'s Photo_Submission.
+    @property
+    def pending_count(self) -> int:
+        return len(self._pending)
 
-        Looks up every Lobby-state Game_Session in which ``user_id`` is
-        currently a Player, via the store's cross-group membership index:
+    def pending_context_for_user(self, user_id: int) -> PendingDMContext | None:
+        """Return a lazily cleaned immutable context for diagnostics/adapters."""
+        return self._refresh_context(user_id)
 
-        - Zero matches: reject with ``reason="no_open_session"``
-          (Req 3.2), without mutating any session.
-        - Exactly one match: store/replace the Photo_Submission on that
-          session's Player and return a Direct_Message confirmation
-          (Req 3.1, 3.3, 3.4). Only currently-Lobby sessions are
-          considered, so a Game_Session the Player was previously part
-          of that has since ended is ignored (Req 11.4).
-        - More than one match: cache the pending ``file_id`` together with
-          the candidate ``group_chat_id``s and ask the Player to pick one
-          (Req 11.3). The photo is held (not stored, not discarded) until
-          :meth:`resolve_disambiguated_submission` completes the store.
+    def cleanup_expired(self, limit: int | None = None) -> int:
+        """Sweep at most the configured number of contexts in one call."""
+        if limit is not None and limit < 0:
+            raise ValueError("limit must be non-negative")
+        requested = self._cleanup_batch_limit if limit is None else limit
+        budget = min(requested, self._cleanup_batch_limit)
+        removed = 0
+        for user_id in tuple(self._pending)[:budget]:
+            existed = user_id in self._pending
+            self._refresh_context(user_id)
+            removed += int(existed and user_id not in self._pending)
+        return removed
 
-        Requirements: 3.1, 3.2, 3.3, 3.4, 11.3, 11.4
-        """
-        candidate_group_chat_ids = [
-            group_chat_id
-            for group_chat_id in self._store.group_chat_ids_for_user(user_id)
-            if (session := self._store.get(group_chat_id)) is not None
-            and session.state == GameState.LOBBY
-        ]
-
-        if not candidate_group_chat_ids:
-            return OperationResult(ok=False, reason="no_open_session")
-
-        if len(candidate_group_chat_ids) > 1:
-            # Multiple current Lobby memberships: the Player must pick one
-            # (Req 11.3). Cache the pending photo so it is neither stored
-            # against an arbitrary session nor discarded, and prompt the
-            # Player to choose via Direct_Message. The candidate list is
-            # also returned in a structured form so the adapter can render
-            # selectable options rather than parse the prompt text.
-            sorted_candidates = tuple(sorted(candidate_group_chat_ids))
-            self._pending[user_id] = _PendingSubmission(
-                file_id=file_id,
-                candidate_group_chat_ids=frozenset(candidate_group_chat_ids),
-                received_at=time.monotonic(),
+    def prepare_submission(
+        self, user_id: int, file_id: str
+    ) -> PreparedPhotoSubmission:
+        """Resolve DM attribution without mutating a game session."""
+        self._refresh_context(user_id)
+        candidate_keys = tuple(
+            sorted(
+                (
+                    key
+                    for key in self._store.active_session_keys_for_user(user_id)
+                    if self._is_valid_candidate(user_id, key)
+                ),
+                key=lambda key: (key.group_chat_id, key.generation),
             )
-            prompt_buttons: list[list[dict[str, str]]] = [
+        )
+        if not candidate_keys:
+            return PreparedPhotoSubmission(
+                OperationResult(ok=False, reason="no_open_session")
+            )
+
+        if len(candidate_keys) > 1:
+            context = PendingDMContext(
+                context_id=self._next_context_id,
+                user_id=user_id,
+                file_id=file_id,
+                candidate_session_keys=frozenset(candidate_keys),
+                expires_at=self._clock() + self._pending_ttl_seconds,
+            )
+            self._next_context_id += 1
+            self._pending[user_id] = context
+            prompt_buttons = [
                 [
                     {
-                        "text": f"💬 المجموعة {gid}",
-                        "callback_data": f"disambiguate:{gid}",
+                        "text": f"💬 المجموعة {key.group_chat_id}",
+                        "callback_data": encode_callback(
+                            key.generation, context.context_id, "dm", index
+                        ),
                     }
                 ]
-                for gid in sorted_candidates
+                for index, key in enumerate(candidate_keys)
             ]
             prompt = Notification(
                 channel="dm",
@@ -135,40 +173,180 @@ class PhotoDistributor:
                 ),
                 buttons=prompt_buttons,
             )
-            return DisambiguationRequired(
+            result = DisambiguationRequired(
                 ok=False,
                 reason="disambiguation_required",
                 notifications=[prompt],
-                candidate_group_chat_ids=sorted_candidates,
+                candidate_group_chat_ids=tuple(
+                    key.group_chat_id for key in candidate_keys
+                ),
+                candidate_session_keys=candidate_keys,
             )
+            return PreparedPhotoSubmission(result, user_id=user_id, file_id=file_id)
 
-        # Exactly one Lobby-state membership: store/replace directly.
-        group_chat_id = candidate_group_chat_ids[0]
-        return self._store_submission(user_id, group_chat_id, file_id)
+        return PreparedPhotoSubmission(
+            OperationResult(ok=True), candidate_keys[0], user_id, file_id
+        )
+
+    def submit_photo(self, user_id: int, file_id: str) -> OperationResult:
+        """Compatibility API; application handlers use prepare/commit instead."""
+        prepared = self.prepare_submission(user_id, file_id)
+        if prepared.session_key is None:
+            return prepared.result
+        return self._store_submission(user_id, prepared.session_key, file_id)
+
+    def commit_submission(
+        self,
+        view: StoreView,
+        user_id: int,
+        key: SessionKey,
+        file_id: str,
+    ) -> OperationResult:
+        """Commit an unambiguous photo under the exact generation lock."""
+        if view.group_chat_id != key.group_chat_id:
+            return OperationResult(False, "cross_group_commit")
+        session = view.get_for_key(key)
+        player = session.players.get(user_id) if session is not None else None
+        valid = (
+            session is not None
+            and not session.terminal
+            and session.state == GameState.LOBBY
+            and session.phase == RoundPhase.LOBBY
+            and player is not None
+            and player.active
+            and key in self._store.active_session_keys_for_user(user_id)
+        )
+        if not valid:
+            return OperationResult(False, "stale_generation")
+        player.photo_file_id = file_id
+        session.revision += 1
+        view.put(session)
+        return self._submission_confirmation(user_id, session)
 
     def resolve_disambiguated_submission(
-        self, user_id: int, chosen_group_chat_id: int
-    ) -> OperationResult:
-        """Complete a disambiguated Photo_Submission once the Player chooses."""
-        pending = self._pending.get(user_id)
-        if pending is None:
-            return OperationResult(ok=False, reason="no_pending_submission")
+        self, user_id: int, chosen_session: int | SessionKey
+    ) -> PendingDMResolution:
+        """Resolve an explicit choice without mutating any game session."""
+        context = self._refresh_context(user_id)
+        if context is None:
+            return PendingDMResolution(False, "no_pending_submission")
 
-        session = self._store.get(chosen_group_chat_id)
-        is_current_lobby_member = (
-            session is not None
-            and session.state == GameState.LOBBY
-            and user_id in session.players
-        )
+        if isinstance(chosen_session, SessionKey):
+            chosen_key = chosen_session
+        else:
+            matching = tuple(
+                key
+                for key in context.candidate_session_keys
+                if key.group_chat_id == chosen_session
+            )
+            if len(matching) != 1:
+                return PendingDMResolution(False, "invalid_choice")
+            chosen_key = matching[0]
+
         if (
-            chosen_group_chat_id not in pending.candidate_group_chat_ids
-            or not is_current_lobby_member
+            chosen_key not in context.candidate_session_keys
+            or not self._is_valid_candidate(user_id, chosen_key)
         ):
+            self._remove_candidate(user_id, chosen_key)
+            return PendingDMResolution(False, "invalid_choice")
+
+        return PendingDMResolution(
+            True,
+            None,
+            context.context_id,
+            user_id,
+            context.file_id,
+            chosen_key,
+            context.expires_at,
+        )
+
+    def commit_disambiguated_submission(
+        self, view: StoreView, resolution: PendingDMResolution
+    ) -> OperationResult:
+        """Commit a resolved payload after authoritative transaction checks."""
+        if not resolution.ok or resolution.session_key is None:
+            return OperationResult(ok=False, reason=resolution.reason or "invalid_choice")
+        if resolution.user_id is None or resolution.file_id is None:
+            return OperationResult(ok=False, reason="invalid_choice")
+        key = resolution.session_key
+        if view.group_chat_id != key.group_chat_id:
+            return OperationResult(ok=False, reason="cross_group_commit")
+
+        context = self._pending.get(resolution.user_id)
+        if context is None or context.context_id != resolution.context_id:
+            return OperationResult(ok=False, reason="no_pending_submission")
+        if context.expires_at <= self._clock():
+            del self._pending[resolution.user_id]
+            return OperationResult(ok=False, reason="pending_expired")
+        if key not in context.candidate_session_keys:
             return OperationResult(ok=False, reason="invalid_choice")
 
-        result = self._store_submission(user_id, chosen_group_chat_id, pending.file_id)
-        del self._pending[user_id]
-        return result
+        session = view.get_for_key(key)
+        player = session.players.get(resolution.user_id) if session else None
+        valid = (
+            session is not None
+            and not session.terminal
+            and session.state == GameState.LOBBY
+            and session.phase == RoundPhase.LOBBY
+            and player is not None
+            and player.active
+            and key
+            in self._store.active_session_keys_for_user(resolution.user_id)
+        )
+        if not valid:
+            self._remove_candidate(resolution.user_id, key)
+            return OperationResult(ok=False, reason="invalid_choice")
+
+        player.photo_file_id = resolution.file_id
+        session.revision += 1
+        view.put(session)
+        del self._pending[resolution.user_id]
+        return self._submission_confirmation(resolution.user_id, session)
+
+    def _is_valid_candidate(self, user_id: int, key: SessionKey) -> bool:
+        session = self._store.get_for_key(key)
+        player = session.players.get(user_id) if session else None
+        return bool(
+            session is not None
+            and not session.terminal
+            and session.state == GameState.LOBBY
+            and session.phase == RoundPhase.LOBBY
+            and player is not None
+            and player.active
+            and key in self._store.active_session_keys_for_user(user_id)
+        )
+
+    def _refresh_context(self, user_id: int) -> PendingDMContext | None:
+        context = self._pending.get(user_id)
+        if context is None:
+            return None
+        if context.expires_at <= self._clock():
+            del self._pending[user_id]
+            return None
+        valid_keys = frozenset(
+            key
+            for key in context.candidate_session_keys
+            if self._is_valid_candidate(user_id, key)
+        )
+        if not valid_keys:
+            del self._pending[user_id]
+            return None
+        if valid_keys != context.candidate_session_keys:
+            context = replace(context, candidate_session_keys=valid_keys)
+            self._pending[user_id] = context
+        return context
+
+    def _remove_candidate(self, user_id: int, key: SessionKey) -> None:
+        context = self._pending.get(user_id)
+        if context is None or key not in context.candidate_session_keys:
+            return
+        remaining = context.candidate_session_keys - {key}
+        if remaining:
+            self._pending[user_id] = replace(
+                context, candidate_session_keys=frozenset(remaining)
+            )
+        else:
+            del self._pending[user_id]
 
     def build_distribution(self, session: GameSession) -> OperationResult:
         """Assign Labels and build the per-recipient distribution DMs."""
@@ -225,14 +403,21 @@ class PhotoDistributor:
 
 
     def _store_submission(
-        self, user_id: int, group_chat_id: int, file_id: str
+        self, user_id: int, key: SessionKey, file_id: str
     ) -> OperationResult:
-        """Store/replace ``user_id``'s photo on ``group_chat_id`` and confirm."""
-        session = self._store.get(group_chat_id)
-        player = session.players[user_id]
-        player.photo_file_id = file_id
+        """Preserve the synchronous single-membership submission path."""
+        session = self._store.get_for_key(key)
+        if session is None or not self._is_valid_candidate(user_id, key):
+            return OperationResult(ok=False, reason="no_open_session")
+        session.players[user_id].photo_file_id = file_id
+        session.revision += 1
         self._store.put(session)
+        return self._submission_confirmation(user_id, session)
 
+    @staticmethod
+    def _submission_confirmation(
+        user_id: int, session: GameSession
+    ) -> OperationResult:
         confirmation = Notification(
             channel="dm",
             target_id=user_id,

@@ -1,11 +1,4 @@
-"""Core data types shared across all game-logic components.
-
-Implements exactly the dataclasses/enum specified in the design document's
-"Data types shared across components" section (Components and Interfaces).
-
-Requirements: Glossary (Game_Session, Player, Photo_Submission, Label,
-Guess, Score)
-"""
+"""Core data types and models for Telegram Spy Game."""
 
 from __future__ import annotations
 
@@ -15,75 +8,75 @@ from typing import Literal
 
 
 class GameState(Enum):
-    """The state a Game_Session progresses through over its lifecycle."""
+    """Explicit state machine states for GameSession."""
 
     LOBBY = "lobby"
-    GUESSING = "guessing"
-    REVEAL = "reveal"
+    DEALING = "dealing"
+    DISCUSSION = "discussion"
+    VOTING = "voting"
+    SPY_LAST_GUESS = "spy_last_guess"
     COMPLETED = "completed"
     CANCELLED = "cancelled"
 
 
 @dataclass
 class Player:
-    """A Telegram user who has joined a Game_Session.
-
-    ``photo_file_id`` represents the Player's Photo_Submission (the
-    Telegram file_id of their photo); ``None`` means not yet submitted.
-    ``active`` becomes False once the Player is marked inactive after
-    leaving during the Guessing state (Req 10.4).
-    """
+    """A Telegram user participating in a GameSession."""
 
     user_id: int
     display_name: str
-    photo_file_id: str | None = None
-    secret_word: str | None = None
-    is_spy: bool = False
+    joined_at: float = 0.0
+    dm_ready: bool = False
     active: bool = True
+    is_spy: bool = False
+    secret_word: str | None = None
 
 
 @dataclass
 class GameSession:
-    """One instance of the photo-guessing game tied to a single Group_Chat."""
+    """An active or historical Spy Game session bound to a single group chat."""
 
+    game_id: str
     group_chat_id: int
     host_id: int
     state: GameState
     players: dict[int, Player]
-    min_players: int = 2
-    max_players: int = 15
-    guessing_timeout_seconds: int = 300
-    labels: dict[str, int] = field(default_factory=dict)
-    guesses: dict[int, dict[str, int]] = field(default_factory=dict)
     created_at: float = 0.0
-    current_turn_user_id: int | None = None
-    turn_order: list[int] = field(default_factory=list)
-    pending_guess_user_id: int | None = None
+    last_activity_at: float = 0.0
+    round_number: int = 1
+    vote_round: int = 1
+    control_message_id: int | None = None
+    secret_location_name: str = ""
+    secret_location_word: str = ""
+    secret_category: str = ""
     spy_user_id: int | None = None
-    secret_location_name: str | None = None
-    secret_location_word: str | None = None
-    votes: dict[int, int] = field(default_factory=dict)
-    voting_active: bool = False
-    spy_guessing_active: bool = False
+    votes: dict[int, int] = field(default_factory=dict)  # voter_id -> target_user_id
+    eligible_vote_targets: list[int] = field(default_factory=list)
+    spy_guess_options: list[str] = field(default_factory=list)
+    spy_guess_attempted: bool = False
+    min_players: int = 3
+    max_players: int = 15
 
 
 @dataclass
 class Notification:
-    """An outbound message a component wants the Telegram Adapter to send."""
+    """Outbound Telegram message or update instruction."""
 
     channel: Literal["group", "dm"]
     target_id: int
     text: str
-    photo_file_id: str | None = None
     buttons: list[list[dict[str, str]]] | None = None
-
+    edit_message_id: int | None = None
+    disable_previous_message_id: int | None = None
 
 
 @dataclass
 class OperationResult:
-    """The uniform return type for every public component method."""
+    """Synchronous outcome of a session decision."""
 
     ok: bool
     reason: str | None = None
+    alert_text: str | None = None
+    show_alert: bool = False
     notifications: list[Notification] = field(default_factory=list)
     session: GameSession | None = None
