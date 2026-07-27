@@ -274,8 +274,18 @@ class TelegramBotRunner:
 
         # Direct Message handling (Private chat)
         if chat_type == "private":
-            await self.send_message(user_id, HELP_GUIDE_HTML, parse_mode="HTML")
+            text = message.get("text", "")
+            if text in ("/help", "/guide", "/rules"):
+                await self.send_message(user_id, HELP_GUIDE_HTML, parse_mode="HTML")
+            else:
+                welcome_dm = (
+                    f"👋 <b>أهلاً بك {display_name}!</b>\n\n"
+                    "أنت الآن متصل ببوت لعبة <b>الجاسوس والكلمة السرية</b>.\n"
+                    "عند بدء الجولة في المجموعة، ستصلك الكلمة السرية أو تنبيه الجاسوس هنا بالخاص مباشرة!"
+                )
+                await self.send_message(user_id, welcome_dm, parse_mode="HTML")
             return
+
 
         # Group chat command handling
         text = message.get("text", "")
