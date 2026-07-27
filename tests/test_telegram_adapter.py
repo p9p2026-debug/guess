@@ -74,36 +74,30 @@ def test_full_happy_path_integration():
         await adapter.handle_dm_photo(user_id=2, file_id="photo_bob")
         await adapter.handle_dm_photo(user_id=3, file_id="photo_carol")
 
-        # 4. Host sets timeout to 5 minutes and starts game
-        await adapter.handle_settimeout(group_id, user_id=1, minutes_str="5")
+        # 4. Host starts game
         start_res = await adapter.handle_startgame(group_id, user_id=1)
         assert start_res.ok is True
         assert start_res.session.state == GameState.GUESSING
+        assert start_res.session.spy_user_id in (1, 2, 3)
 
-        # Verify DMs were sent out to each recipient carrying other players' photos
-        assert len(transport.sent_photos) == 6  # 3 players * 2 photos each
+        # Verify DM notifications were sent to all 3 players with their secret words
+        dm_messages = [msg for gid, msg in transport.sent_messages if gid != group_id]
+        assert len(dm_messages) >= 3
 
-        # 5. Players make guesses
-        # Alice guesses Photo B is Bob
-        await adapter.handle_guess(group_id, guesser_id=1, text_args="Photo B Bob")
-        # Bob guesses Photo A is Alice
-        await adapter.handle_guess(group_id, guesser_id=2, text_args="Photo A Alice")
+        # 5. Start voting and record votes
+        await adapter.handle_start_voting(group_id)
+        spy_id = start_res.session.spy_user_id
+        await adapter.handle_spy_vote(group_id, voter_id=1, target_id=spy_id)
+        await adapter.handle_spy_vote(group_id, voter_id=2, target_id=spy_id)
+        res_vote = await adapter.handle_spy_vote(group_id, voter_id=3, target_id=spy_id)
+        assert res_vote.ok is True
 
-        # 6. Timer expires -> triggers Reveal and transition to Completed
-        scheduler.fire_all()
-        await asyncio.sleep(0)
-
-        session = store.get(group_id)
-        assert session.state == GameState.COMPLETED
-
-
-        # Check reveal notifications reached the group chat
+        # Check reveal/voting notifications reached group
         group_texts = [text for gid, text in transport.sent_messages if gid == group_id]
-        reveal_text = "\n".join(group_texts)
-        assert "انتهى الوقت!" in reveal_text or "النتائج النهائية" in reveal_text or len(group_texts) > 0
-
+        assert len(group_texts) > 0
 
     asyncio.run(_test())
+
 
 
 def test_adapter_boundary_rejections():

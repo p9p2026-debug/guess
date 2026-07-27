@@ -178,7 +178,28 @@ class TelegramBotRunner:
             chat_id = message.get("chat", {}).get("id")
             data = callback.get("data", "")
 
-            if data == "answer:yes" and chat_id:
+            if data == "start_voting" and chat_id:
+                res = await self.adapter.handle_start_voting(group_chat_id=chat_id)
+                await self.answer_callback_query(cb_id, text="بدأ التصويت! 🗳️")
+            elif data.startswith("vote:") and chat_id:
+                target_id = int(data.split(":", 1)[1])
+                res = await self.adapter.handle_spy_vote(
+                    group_chat_id=chat_id, voter_id=user_id, target_id=target_id
+                )
+                await self.answer_callback_query(cb_id, text="تم تسجيل صوتك! 🗳️")
+            elif data == "spy_guess_menu" and chat_id:
+                res = await self.adapter.handle_spy_guess_menu(
+                    group_chat_id=chat_id, user_id=user_id
+                )
+                toast = "قائمة التخمين للجاسوس 💡" if res.ok else "مخصص للجاسوس فقط! ⚠️"
+                await self.answer_callback_query(cb_id, text=toast)
+            elif data.startswith("spy_guess:") and chat_id:
+                word_guess = data.split(":", 1)[1]
+                res = await self.adapter.handle_spy_guess(
+                    group_chat_id=chat_id, spy_id=user_id, word_guess=word_guess
+                )
+                await self.answer_callback_query(cb_id, text=f"تم تخمين: {word_guess}")
+            elif data == "answer:yes" and chat_id:
                 res = await self.adapter.handle_answer(
                     group_chat_id=chat_id, responder_id=user_id, answer_type="yes"
                 )
@@ -203,6 +224,7 @@ class TelegramBotRunner:
                     else "تعذر الانضمام."
                 )
                 await self.answer_callback_query(cb_id, text=toast)
+
 
             elif data == "leave_game" and chat_id:
                 res = await self.adapter.handle_leave(group_chat_id=chat_id, user_id=user_id)

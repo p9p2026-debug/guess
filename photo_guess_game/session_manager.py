@@ -9,9 +9,12 @@ the Telegram Adapter's responsibility.
 
 from __future__ import annotations
 
+import random
 import time
+from typing import Callable
 
 from .guess_tracker import GuessTracker
+from .locations import LOCATIONS, get_location_options, get_random_location
 from .models import GameSession, GameState, Notification, OperationResult, Player
 from .photo_distributor import PhotoDistributor
 from .score_tracker import ScoreTracker
@@ -303,57 +306,70 @@ class SessionManager:
                 session=session,
             )
 
-        missing = [
-            p for p in session.players.values() if p.photo_file_id is None
-        ]
-        if missing:
-            missing_names = [p.display_name for p in missing]
-            return OperationResult(
-                ok=False,
-                reason="missing_photos",
-                notifications=[
+        session.state = GameState.GUESSING
+
+        loc = get_random_location()
+        session.secret_location_name = loc["name"]
+        session.secret_location_word = loc["word"]
+
+        active_uids = [uid for uid, p in session.players.items() if p.active]
+        spy_uid = random.choice(active_uids)
+        session.spy_user_id = spy_uid
+        session.votes.clear()
+
+        all_notifications: list[Notification] = []
+        for uid in active_uids:
+            p = session.players[uid]
+            if uid == spy_uid:
+                p.is_spy = True
+                all_notifications.append(
                     Notification(
-                        channel="group",
-                        target_id=group_chat_id,
+                        channel="dm",
+                        target_id=uid,
                         text=(
-                            "لا يمكن البدء: اللاعبون التاليون لم يرسلوا صورهم بعد: "
-                            + ", ".join(missing_names)
+                            "🕵️ <b>أنت الجاسوس في هذه الجولة!</b>\n\n"
+                            "لا تعرف الكلمة السرية للموقع!\n"
+                            "تظاهر بأنك تعرف الكلمة واستمع لأسئلة المنافسين في المحادثة بذكاء حتى تكتشف المكان!"
                         ),
                     )
-                ],
-                session=session,
-            )
+                )
+            else:
+                p.is_spy = False
+                all_notifications.append(
+                    Notification(
+                        channel="dm",
+                        target_id=uid,
+                        text=(
+                            f"🤫 <b>الكلمة السرية للموقع هي: {loc['name']}!</b>\n\n"
+                            "احذر أن تكتشفك الجاسوس! اسأل أسئلة ذكية في المحادثة لاكتشاف الجاسوس دون كشف الكلمة السرية."
+                        ),
+                    )
+                )
 
-        # Transition to GUESSING
-        session.state = GameState.GUESSING
-        session.turn_order = [uid for uid, p in session.players.items() if p.active]
-        if session.turn_order:
-            session.current_turn_user_id = session.turn_order[0]
+        spy_buttons = [
+            [
+                {"text": "🗳️ بدء التصويت على الجاسوس", "callback_data": "start_voting"},
+            ],
+            [
+                {"text": "💡 تخمين الكلمة السرية (للجاسوس)", "callback_data": "spy_guess_menu"},
+            ],
+        ]
 
-        # Distribute photos / assign labels
-        dist_res = self._photo_distributor.build_distribution(session)
-
-        duration = session.guessing_timeout_seconds
-        current_p = (
-            session.players[session.current_turn_user_id]
-            if session.current_turn_user_id
-            else next(iter(session.players.values()))
-        )
-
-        announcement = Notification(
+        group_announcement = Notification(
             channel="group",
             target_id=group_chat_id,
             text=(
-                f"⏱️ <b>بدأت جولة الأسئلة والتخمين! (Hedbanz)</b>\n\n"
-                f"🎲 <b>دورك الآن يا {current_p.display_name}!</b>\n"
-                "• اسأل سؤالك عن صورتك في المحادثة والمنافسون يجيبون بـ 🟢 نعم أو 🔴 لا أدناه.\n"
-                "• أو اضغط <b>🎯 بدي أخمن!</b> للتخمين المباشر."
+                f"🕵️ <b>تم توزيع الكلمات السرية بالخاص لجميع اللاعبين!</b>\n\n"
+                "• هناك <b>جاسوس واحد</b> بينكم لا يعرف الكلمة السرية!\n"
+                "• ابدأوا النقاش والأسئلة فوراً في المحادثة.\n"
+                "• عند الجاهزية، اضغطوا <b>🗳️ بدء التصويت على الجاسوس</b> أدناه."
             ),
-            buttons=_TURN_BUTTONS,
+            buttons=spy_buttons,
         )
 
-        all_notifications = [announcement] + dist_res.notifications
+        all_notifications.insert(0, group_announcement)
 
+        duration = session.guessing_timeout_seconds
         if self._timer_service is not None:
             self._timer_service.start(
                 group_chat_id,
@@ -839,13 +855,10 @@ class SessionManager:
         return Notification(
             channel="group",
             target_id=session.group_chat_id,
-            text=(
-                f"🎲 <b>دورك الآن يا {next_p.display_name}!</b>\n"
-                "• اسأل سؤالك في المحادثة والمنافسون يجيبون بـ 🟢 نعم أو 🔴 لا.\n"
-                "• أو اضغط <b>🎯 بدي أخمن!</b> للتخمين المباشر."
-            ),
+            text=f"🎲 دورك الآن يا {next_p.display_name}!",
             buttons=_TURN_BUTTONS,
         )
+
 
     def record_answer(
         self, group_chat_id: int, responder_id: int, answer_type: str
@@ -906,6 +919,8 @@ class SessionManager:
         if guesser is None:
             return OperationResult(ok=False, reason="not_member", session=session)
 
+        duration = session.guessing_timeout_seconds
+
         clean_guess = guess_text.strip().lower()
 
         is_correct = False
@@ -943,3 +958,196 @@ class SessionManager:
         return OperationResult(
             ok=True, notifications=[fail_notif, turn_notif], session=session
         )
+
+    def start_voting_panel(self, group_chat_id: int) -> OperationResult:
+        session = self._store.get(group_chat_id)
+        if session is None or session.state != GameState.GUESSING:
+            return OperationResult(ok=False, reason="not_in_guessing", session=session)
+
+        session.voting_active = True
+        session.votes.clear()
+
+        vote_buttons: list[list[dict[str, str]]] = []
+        active_players = [p for p in session.players.values() if p.active]
+        row: list[dict[str, str]] = []
+        for p in active_players:
+            row.append({"text": f"👤 {p.display_name}", "callback_data": f"vote:{p.user_id}"})
+            if len(row) == 2:
+                vote_buttons.append(row)
+                row = []
+        if row:
+            vote_buttons.append(row)
+
+        self._store.put(session)
+        panel = Notification(
+            channel="group",
+            target_id=group_chat_id,
+            text=(
+                "🗳️ <b>بدأ التصويت على الجاسوس!</b>\n\n"
+                "اضغط على اسم اللاعب الذي تشك أنه الجاسوس أدناه:"
+            ),
+            buttons=vote_buttons,
+        )
+        return OperationResult(ok=True, notifications=[panel], session=session)
+
+    def record_spy_vote(
+        self, group_chat_id: int, voter_id: int, target_id: int
+    ) -> OperationResult:
+        session = self._store.get(group_chat_id)
+        if session is None or session.state != GameState.GUESSING:
+            return OperationResult(ok=False, reason="not_in_guessing", session=session)
+
+        if voter_id not in session.players:
+            return OperationResult(ok=False, reason="not_member", session=session)
+
+        session.votes[voter_id] = target_id
+        active_players = [p for p in session.players.values() if p.active]
+        total_active = len(active_players)
+
+        voter = session.players[voter_id]
+        voted_count = len(session.votes)
+
+        notif_list: list[Notification] = [
+            Notification(
+                channel="group",
+                target_id=group_chat_id,
+                text=f"🗳️ قام <b>{voter.display_name}</b> بالتصويت! ({voted_count}/{total_active} أصوات)",
+            )
+        ]
+
+        # Check if all players have voted
+        if voted_count >= total_active:
+            # Tally votes
+            tally: dict[int, int] = {}
+            for tid in session.votes.values():
+                tally[tid] = tally.get(tid, 0) + 1
+
+            most_voted_id = max(tally, key=tally.get)
+            accused = session.players[most_voted_id]
+            spy_player = session.players.get(session.spy_user_id) if session.spy_user_id else None
+
+            if most_voted_id == session.spy_user_id:
+                # Correctly identified the Spy! Give Spy 1 chance to guess location
+                session.spy_guessing_active = True
+                options = get_location_options(session.secret_location_word or "مستشفى")
+                spy_guess_buttons: list[list[dict[str, str]]] = []
+                r: list[dict[str, str]] = []
+                for w in options:
+                    r.append({"text": w, "callback_data": f"spy_guess:{w}"})
+                    if len(r) == 2:
+                        spy_guess_buttons.append(r)
+                        r = []
+                if r:
+                    spy_guess_buttons.append(r)
+
+                notif_list.append(
+                    Notification(
+                        channel="group",
+                        target_id=group_chat_id,
+                        text=(
+                            f"🎉 <b>أصلتم الكشف!</b> بأغلبية الأصوات، الشخص المطرود هو الجاسوس الحقيقي <b>{accused.display_name}</b>! 🕵️\n\n"
+                            f"⚠️ <b>فرصة أخيره للجاسوس:</b> يا {accused.display_name}، خمن الكلمة السرية للموقع أدناه للهروب بالفوز!"
+                        ),
+                        buttons=spy_guess_buttons,
+                    )
+                )
+            else:
+                # Wrong person accused -> Spy Wins!
+                session.state = GameState.COMPLETED
+                spy_name = spy_player.display_name if spy_player else "الجاسوس"
+                notif_list.append(
+                    Notification(
+                        channel="group",
+                        target_id=group_chat_id,
+                        text=(
+                            f"🎉 <b>فاز الجاسوس! 🕵️🏆</b>\n\n"
+                            f"قام الجميع بطرد خاطئ لـ <b>{accused.display_name}</b>!\n"
+                            f"بينما الجاسوس الحقيقي <b>{spy_name}</b> نجح بالتمويه والمكر وخدع الجميع!\n"
+                            f"📍 المكان السري كان: <b>{session.secret_location_name}</b>"
+                        ),
+                    )
+                )
+
+        self._store.put(session)
+        return OperationResult(ok=True, notifications=notif_list, session=session)
+
+    def handle_spy_guess_menu(
+        self, group_chat_id: int, user_id: int
+    ) -> OperationResult:
+        session = self._store.get(group_chat_id)
+        if session is None or session.state != GameState.GUESSING:
+            return OperationResult(ok=False, reason="not_in_guessing", session=session)
+
+        if user_id != session.spy_user_id:
+            return OperationResult(
+                ok=False,
+                reason="not_spy",
+                notifications=[
+                    Notification(
+                        channel="group",
+                        target_id=group_chat_id,
+                        text="⚠️ عذراً، هذا الخيار مخصص للجاسوس فقط!",
+                    )
+                ],
+                session=session,
+            )
+
+        options = get_location_options(session.secret_location_word or "مستشفى")
+        spy_guess_buttons: list[list[dict[str, str]]] = []
+        r: list[dict[str, str]] = []
+        for w in options:
+            r.append({"text": w, "callback_data": f"spy_guess:{w}"})
+            if len(r) == 2:
+                spy_guess_buttons.append(r)
+                r = []
+        if r:
+            spy_guess_buttons.append(r)
+
+        spy_p = session.players[user_id]
+        return OperationResult(
+            ok=True,
+            notifications=[
+                Notification(
+                    channel="group",
+                    target_id=group_chat_id,
+                    text=f"💡 <b>الجاسوس {spy_p.display_name} يرفع التحدي للتخمين!</b> اختر المكان الصحيح أدناه:",
+                    buttons=spy_guess_buttons,
+                )
+            ],
+            session=session,
+        )
+
+    def submit_spy_location_guess(
+        self, group_chat_id: int, spy_id: int, word_guess: str
+    ) -> OperationResult:
+        session = self._store.get(group_chat_id)
+        if session is None or session.state != GameState.GUESSING:
+            return OperationResult(ok=False, reason="not_in_guessing", session=session)
+
+        spy = session.players.get(spy_id)
+        spy_name = spy.display_name if spy else "الجاسوس"
+        session.state = GameState.COMPLETED
+
+        if session.secret_location_word and word_guess.strip().lower() == session.secret_location_word.lower():
+            notif = Notification(
+                channel="group",
+                target_id=group_chat_id,
+                text=(
+                    f"🎉 <b>تخمين عبقري من الجاسوس! 🕵️🏆</b>\n\n"
+                    f"الجاسوس <b>{spy_name}</b> عرف الموقع السري الصحيح: <b>{session.secret_location_name}</b> وقام بالهروب وفاز بالجولة!"
+                ),
+            )
+        else:
+            notif = Notification(
+                channel="group",
+                target_id=group_chat_id,
+                text=(
+                    f"❌ <b>تخمين خاطئ من الجاسوس!</b>\n\n"
+                    f"حاول الجاسوس {spy_name} تخمين <code>{word_guess}</code>، لكن المكان الحقيقي كان <b>{session.secret_location_name}</b>!\n"
+                    f"🎉 <b>فاز المواطنون بالأغلبية! 👥🏆</b>"
+                ),
+            )
+
+        self._store.put(session)
+        return OperationResult(ok=True, notifications=[notif], session=session)
+

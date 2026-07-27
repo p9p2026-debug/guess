@@ -247,9 +247,50 @@ class TelegramAdapter:
             await self.dispatch_notifications(res.notifications)
             return res
 
+    async def handle_start_voting(self, group_chat_id: int) -> OperationResult:
+        """Handle start_voting button click."""
+        async with self._store.lock_for(group_chat_id):
+            res = self.session_manager.start_voting_panel(group_chat_id=group_chat_id)
+            await self.dispatch_notifications(res.notifications)
+            return res
+
+    async def handle_spy_vote(
+        self, group_chat_id: int, voter_id: int, target_id: int
+    ) -> OperationResult:
+        """Handle player vote button click."""
+        async with self._store.lock_for(group_chat_id):
+            res = self.session_manager.record_spy_vote(
+                group_chat_id=group_chat_id, voter_id=voter_id, target_id=target_id
+            )
+            await self.dispatch_notifications(res.notifications)
+            return res
+
+    async def handle_spy_guess_menu(
+        self, group_chat_id: int, user_id: int
+    ) -> OperationResult:
+        """Handle spy_guess_menu button click."""
+        async with self._store.lock_for(group_chat_id):
+            res = self.session_manager.handle_spy_guess_menu(
+                group_chat_id=group_chat_id, user_id=user_id
+            )
+            await self.dispatch_notifications(res.notifications)
+            return res
+
+    async def handle_spy_guess(
+        self, group_chat_id: int, spy_id: int, word_guess: str
+    ) -> OperationResult:
+        """Handle spy_guess location button click."""
+        async with self._store.lock_for(group_chat_id):
+            res = self.session_manager.submit_spy_location_guess(
+                group_chat_id=group_chat_id, spy_id=spy_id, word_guess=word_guess
+            )
+            await self.dispatch_notifications(res.notifications)
+            return res
+
     async def handle_answer(
         self, group_chat_id: int, responder_id: int, answer_type: str
     ) -> OperationResult:
+
         """Handle Yes/No answer button click from opponent."""
         async with self._store.lock_for(group_chat_id):
             res = self.session_manager.record_answer(

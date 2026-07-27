@@ -41,16 +41,10 @@ def test_start_session_success():
     sm.join_session(group_chat_id=10, user_id=2, display_name="Bob")
     sm.join_session(group_chat_id=10, user_id=3, display_name="Carol")
 
-    # Submit photos for all players
-    pd = PhotoDistributor(store)
-    pd.submit_photo(1, "photo1")
-    pd.submit_photo(2, "photo2")
-    pd.submit_photo(3, "photo3")
-
     res = sm.start_session(group_chat_id=10, requester_id=1)
     assert res.ok is True, res
     assert res.session.state == GameState.GUESSING
-    assert len(res.session.labels) == 3
+    assert res.session.spy_user_id in (1, 2, 3)
     assert len(res.notifications) > 0
 
 
@@ -72,10 +66,6 @@ def test_start_session_rejections():
     assert res.ok is False
     assert res.reason == "not_host"
 
-    # Rejection 3: Missing photos
-    res = sm.start_session(10, requester_id=1)
-    assert res.ok is False
-    assert res.reason == "missing_photos"
 
 
 def test_guessing_state_leave_below_minimum_cancels():

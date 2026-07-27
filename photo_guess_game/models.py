@@ -38,6 +38,7 @@ class Player:
     display_name: str
     photo_file_id: str | None = None
     secret_word: str | None = None
+    is_spy: bool = False
     active: bool = True
 
 
@@ -58,6 +59,12 @@ class GameSession:
     current_turn_user_id: int | None = None
     turn_order: list[int] = field(default_factory=list)
     pending_guess_user_id: int | None = None
+    spy_user_id: int | None = None
+    secret_location_name: str | None = None
+    secret_location_word: str | None = None
+    votes: dict[int, int] = field(default_factory=dict)
+    voting_active: bool = False
+    spy_guessing_active: bool = False
 
 
 @dataclass
