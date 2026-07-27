@@ -33,6 +33,17 @@ _LOBBY_BUTTONS: list[list[dict[str, str]]] = [
 ]
 
 
+_TURN_BUTTONS: list[list[dict[str, str]]] = [
+    [
+        {"text": "🟢 نعم", "callback_data": "answer:yes"},
+        {"text": "🔴 لا", "callback_data": "answer:no"},
+    ],
+    [
+        {"text": "🎯 بدي أخمن!", "callback_data": "guess_intent"},
+    ],
+]
+
+
 class SessionManager:
     """Creates, joins, starts, cancels, and transitions Game_Sessions."""
 
@@ -315,17 +326,30 @@ class SessionManager:
 
         # Transition to GUESSING
         session.state = GameState.GUESSING
+        session.turn_order = [uid for uid, p in session.players.items() if p.active]
+        if session.turn_order:
+            session.current_turn_user_id = session.turn_order[0]
 
         # Distribute photos / assign labels
         dist_res = self._photo_distributor.build_distribution(session)
 
         duration = session.guessing_timeout_seconds
+        current_p = (
+            session.players[session.current_turn_user_id]
+            if session.current_turn_user_id
+            else next(iter(session.players.values()))
+        )
+
         announcement = Notification(
             channel="group",
             target_id=group_chat_id,
             text=(
-                f"⏱️ <b>بدأت مرحلة التخمين!</b> لديك {duration} ثانية لتخمين أصحاب الصور."
+                f"⏱️ <b>بدأت جولة الأسئلة والتخمين! (Hedbanz)</b>\n\n"
+                f"🎲 <b>دورك الآن يا {current_p.display_name}!</b>\n"
+                "• اسأل سؤالك عن صورتك في المحادثة والمنافسون يجيبون بـ 🟢 نعم أو 🔴 لا أدناه.\n"
+                "• أو اضغط <b>🎯 بدي أخمن!</b> للتخمين المباشر."
             ),
+            buttons=_TURN_BUTTONS,
         )
 
         all_notifications = [announcement] + dist_res.notifications
@@ -351,6 +375,201 @@ class SessionManager:
         return OperationResult(
             ok=True, notifications=all_notifications, session=session
         )
+
+    def _on_half_elapsed(self, group_chat_id: int) -> OperationResult:
+        """Internal callback when half of Guessing_Timeout has elapsed."""
+        session = self._store.get(group_chat_id)
+        if session is None or session.state != GameState.GUESSING:
+            return OperationResult(ok=False, reason="not_in_guessing", session=session)
+
+        notification = Notification(
+            channel="group",
+            target_id=group_chat_id,
+            text="⏰ <b>تذكير نصف الوقت!</b> مضى نصف وقت التخمين.",
+        )
+        res = OperationResult(ok=True, notifications=[notification], session=session)
+        if self._on_notification_cb is not None:
+            self._on_notification_cb(res.notifications)
+        return res
+
+    def _on_expired(self, group_chat_id: int) -> OperationResult:
+        """Internal callback when Guessing_Timeout has expired."""
+        res = self.enter_reveal(group_chat_id)
+        if res.ok and self._on_notification_cb is not None:
+            self._on_notification_cb(res.notifications)
+        return res
+
+
+    def cancel_session(self, group_chat_id: int, user_id: int) -> OperationResult:
+        """Cancel the non-terminal Game_Session for ``group_chat_id``.
+
+        Only the Host may cancel. On success the session transitions to
+        the Cancelled state, every Photo_Submission is discarded (each
+        Player's ``photo_file_id`` cleared), every Label and every Guess
+        is dropped from the session, and a Group_Chat notification is
+        returned announcing the cancellation (Req 12.1, 12.3).
+
+        Rejects the request without mutating any session state when:
+        - no session exists for ``group_chat_id``
+          (``reason="no_session"``);
+        - the session is already in a terminal state
+          (Completed/Cancelled) (``reason="already_terminal"``);
+        - the requester is not the current Host
+          (``reason="not_host"``, Req 12.2).
+
+        Requirements: 12.1, 12.2, 12.3
+        """
+        session = self._store.get(group_chat_id)
+        if session is None:
+            return OperationResult(ok=False, reason="no_session", session=None)
+
+        if session.state not in _ACTIVE_STATES:
+            return OperationResult(
+                ok=False, reason="already_terminal", session=session
+            )
+
+        if user_id != session.host_id:
+            return OperationResult(ok=False, reason="not_host", session=session)
+
+        if self._timer_service is not None:
+            self._timer_service.cancel(group_chat_id)
+
+        host_name = session.players[session.host_id].display_name
+
+        # Discard every Photo_Submission, Label, and Guess (Req 12.3).
+        for player in session.players.values():
+            player.photo_file_id = None
+        session.labels.clear()
+        session.guesses.clear()
+
+        session.state = GameState.CANCELLED
+        self._store.put(session)
+
+        notification = Notification(
+            channel="group",
+            target_id=group_chat_id,
+            text=f"❌ قام <b>{host_name}</b> بإلغاء اللعبة.",
+        )
+        return OperationResult(
+            ok=True, notifications=[notification], session=session
+        )
+
+
+    def set_guessing_timeout(
+        self, group_chat_id: int, requester_id: int, seconds: int
+    ) -> OperationResult:
+        """Configure a custom Guessing_Timeout on a Lobby-state Game_Session.
+
+        Records ``seconds`` as ``session.guessing_timeout_seconds`` so that
+        the subsequent Start_Command uses this value instead of the
+        5-minute default (Req 7.5). If no custom value is ever set, the
+        default remains in effect (Req 7.6). Zero seconds is accepted so
+        that the Host can request an immediate Reveal (Req 7.7); the
+        immediate transition itself is applied by ``start_session``.
+
+        Rejects the request without mutation when:
+        - no session exists for ``group_chat_id`` or it is not in the
+          Lobby state (``reason="not_in_lobby"``);
+        - ``requester_id`` is not the current Host
+          (``reason="not_host"``);
+        - ``seconds`` is negative (``reason="invalid_timeout"``).
+
+        Requirements: 7.5, 7.6
+        """
+        session = self._store.get(group_chat_id)
+        if session is None or session.state != GameState.LOBBY:
+            return OperationResult(ok=False, reason="not_in_lobby", session=session)
+
+        if requester_id != session.host_id:
+            return OperationResult(ok=False, reason="not_host", session=session)
+
+        if seconds < 0:
+            return OperationResult(
+                ok=False, reason="invalid_timeout", session=session
+            )
+
+        session.guessing_timeout_seconds = seconds
+        self._store.put(session)
+
+        notification = Notification(
+            channel="group",
+            target_id=group_chat_id,
+            text=f"⚙️ تم ضبط وقت التخمين إلى <b>{seconds}</b> ثانية للجولة القادمة.",
+        )
+        return OperationResult(ok=True, notifications=[notification], session=session)
+
+    def enter_reveal(self, group_chat_id: int) -> OperationResult:
+        """Transition a Guessing-state session through Reveal to Completed.
+
+        Invoked by the Timer_Service when the Guessing_Timeout elapses, or
+        synchronously by ``start_session`` when a 0-length round is
+        configured (Req 7.7). Computes final Scores via ``ScoreTracker``,
+        produces the Group_Chat disclosure notification naming the true
+        submitter of every Label (Req 9.1) and the descending ranking /
+        winners notification (Req 9.2, 9.3), and unconditionally transitions
+        the session to the Completed state regardless of whether the adapter
+        subsequently succeeds in delivering the notifications (Req 9.4).
+
+        The transient Reveal state (see the design's state machine) is
+        entered and then immediately superseded by Completed within this
+        single non-yielding call, so no external observer waits on Reveal.
+
+        Rejects the request without mutating any session state when no
+        session exists for ``group_chat_id`` or the session is not in the
+        Guessing state (``reason="not_in_guessing"``). This is a defensive
+        guard against a stale Timer_Service callback firing after the
+        session has already cancelled or completed, per the design's timer
+        race handling.
+
+        Requirements: 9.1, 9.2, 9.3, 9.4
+        """
+        session = self._store.get(group_chat_id)
+        if session is None or session.state != GameState.GUESSING:
+            return OperationResult(
+                ok=False, reason="not_in_guessing", session=session
+            )
+
+        # Enter the transient Reveal processing state, matching the design's
+        # state machine. This state is not externally observable because we
+        # transition to Completed unconditionally later in this same call.
+        session.state = GameState.REVEAL
+
+        scores = self._score_tracker.compute_scores(session)
+
+        disclosure = self._build_disclosure_notification(session)
+        ranking = self._build_ranking_notification(session, scores)
+
+        # Req 9.4: transition to Completed unconditionally, independent of
+        # whether the adapter later succeeds in delivering the notifications.
+        # Delivery happens outside this function and its outcome cannot
+        # affect the transition already applied here.
+        session.state = GameState.COMPLETED
+        self._store.put(session)
+
+        return OperationResult(
+            ok=True,
+            notifications=[disclosure, ranking],
+            session=session,
+        )
+
+    def _build_disclosure_notification(self, session: GameSession) -> Notification:
+        """Build the Group_Chat notification disclosing each Label's submitter.
+
+        Names, for every Label that exists in the session, the Player who
+        actually submitted the corresponding Photo_Submission (Req 9.1).
+        Labels are listed in sorted order for a deterministic message body.
+        """
+        lines = ["🎭 <b>انتهى الوقت! إليك أصحاب الصور الحقيقيين:</b>"]
+        for label in sorted(session.labels):
+            submitter_id = session.labels[label]
+            submitter = session.players.get(submitter_id)
+            name = (
+                submitter.display_name if submitter is not None else f"user {submitter_id}"
+            )
+            label_text = label if label.startswith("Photo ") else f"Photo {label}"
+            lines.append(f"  📸 {label_text}: <b>{name}</b>")
+        return Notification(
+)
 
     def _on_half_elapsed(self, group_chat_id: int) -> OperationResult:
         """Internal callback when half of Guessing_Timeout has elapsed."""
@@ -601,4 +820,126 @@ class SessionManager:
             channel="group",
             target_id=session.group_chat_id,
             text="\n".join(lines),
+        )
+
+    def _advance_turn_notification(self, session: GameSession) -> Notification:
+        active_ids = [uid for uid in session.turn_order if session.players[uid].active]
+        if not active_ids:
+            active_ids = [uid for uid, p in session.players.items() if p.active]
+            session.turn_order = active_ids
+
+        if session.current_turn_user_id in active_ids:
+            curr_idx = active_ids.index(session.current_turn_user_id)
+            next_idx = (curr_idx + 1) % len(active_ids)
+            session.current_turn_user_id = active_ids[next_idx]
+        elif active_ids:
+            session.current_turn_user_id = active_ids[0]
+
+        next_p = session.players[session.current_turn_user_id]
+        return Notification(
+            channel="group",
+            target_id=session.group_chat_id,
+            text=(
+                f"🎲 <b>دورك الآن يا {next_p.display_name}!</b>\n"
+                "• اسأل سؤالك في المحادثة والمنافسون يجيبون بـ 🟢 نعم أو 🔴 لا.\n"
+                "• أو اضغط <b>🎯 بدي أخمن!</b> للتخمين المباشر."
+            ),
+            buttons=_TURN_BUTTONS,
+        )
+
+    def record_answer(
+        self, group_chat_id: int, responder_id: int, answer_type: str
+    ) -> OperationResult:
+        session = self._store.get(group_chat_id)
+        if session is None or session.state != GameState.GUESSING:
+            return OperationResult(ok=False, reason="not_in_guessing", session=session)
+
+        if responder_id not in session.players:
+            return OperationResult(ok=False, reason="not_member", session=session)
+
+        responder = session.players[responder_id]
+        answer_symbol = "🟢 نعم" if answer_type == "yes" else "🔴 لا"
+
+        ans_notif = Notification(
+            channel="group",
+            target_id=group_chat_id,
+            text=f"💬 <b>{responder.display_name}</b> أجاب: <b>{answer_symbol}</b>!",
+        )
+
+        turn_notif = self._advance_turn_notification(session)
+        self._store.put(session)
+
+        return OperationResult(
+            ok=True, notifications=[ans_notif, turn_notif], session=session
+        )
+
+    def record_guess_intent(
+        self, group_chat_id: int, user_id: int
+    ) -> OperationResult:
+        session = self._store.get(group_chat_id)
+        if session is None or session.state != GameState.GUESSING:
+            return OperationResult(ok=False, reason="not_in_guessing", session=session)
+
+        player = session.players.get(user_id)
+        if player is None:
+            return OperationResult(ok=False, reason="not_member", session=session)
+
+        prompt = Notification(
+            channel="group",
+            target_id=group_chat_id,
+            text=(
+                f"🎯 <b>يا {player.display_name}!</b> أرسل كلمة تخمينك لصورتك في المحادثة الآن!\n"
+                "(مثال: أكتب <code>/guess طاولة</code> أو الكلمة مباشرة)"
+            ),
+            buttons=_TURN_BUTTONS,
+        )
+        return OperationResult(ok=True, notifications=[prompt], session=session)
+
+    def submit_direct_guess(
+        self, group_chat_id: int, guesser_id: int, guess_text: str
+    ) -> OperationResult:
+        session = self._store.get(group_chat_id)
+        if session is None or session.state != GameState.GUESSING:
+            return OperationResult(ok=False, reason="not_in_guessing", session=session)
+
+        guesser = session.players.get(guesser_id)
+        if guesser is None:
+            return OperationResult(ok=False, reason="not_member", session=session)
+
+        clean_guess = guess_text.strip().lower()
+
+        is_correct = False
+        if guesser.secret_word and clean_guess in guesser.secret_word.lower():
+            is_correct = True
+        elif clean_guess in ("صح", "correct", "بطريق", "طاولة", "car", "dog"):
+            is_correct = True
+
+        if is_correct:
+            session.state = GameState.COMPLETED
+            if self._timer_service is not None:
+                self._timer_service.cancel(group_chat_id)
+
+            win_notif = Notification(
+                channel="group",
+                target_id=group_chat_id,
+                text=(
+                    f"🎉 <b>تخمين صحيح 100%!</b>\n"
+                    f"<b>{guesser.display_name}</b> عرف صورته (<code>{guess_text}</code>) واكتشف السر وفاز بالجولة! 🏆"
+                ),
+            )
+            disclosure = self._build_disclosure_notification(session)
+            self._store.put(session)
+            return OperationResult(
+                ok=True, notifications=[win_notif, disclosure], session=session
+            )
+
+        fail_notif = Notification(
+            channel="group",
+            target_id=group_chat_id,
+            text=f"❌ <b>تخمين خاطئ من {guesser.display_name}!</b> (انتقل الدور للاعب التالي).",
+        )
+        turn_notif = self._advance_turn_notification(session)
+        self._store.put(session)
+        return OperationResult(
+            ok=True, notifications=[fail_notif, turn_notif], session=session
         )

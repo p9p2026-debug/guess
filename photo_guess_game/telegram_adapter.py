@@ -247,11 +247,46 @@ class TelegramAdapter:
             await self.dispatch_notifications(res.notifications)
             return res
 
+    async def handle_answer(
+        self, group_chat_id: int, responder_id: int, answer_type: str
+    ) -> OperationResult:
+        """Handle Yes/No answer button click from opponent."""
+        async with self._store.lock_for(group_chat_id):
+            res = self.session_manager.record_answer(
+                group_chat_id=group_chat_id,
+                responder_id=responder_id,
+                answer_type=answer_type,
+            )
+            await self.dispatch_notifications(res.notifications)
+            return res
+
+    async def handle_guess_intent(
+        self, group_chat_id: int, user_id: int
+    ) -> OperationResult:
+        """Handle guess intent button click from active player."""
+        async with self._store.lock_for(group_chat_id):
+            res = self.session_manager.record_guess_intent(
+                group_chat_id=group_chat_id, user_id=user_id
+            )
+            await self.dispatch_notifications(res.notifications)
+            return res
+
     async def handle_guess(
         self, group_chat_id: int, guesser_id: int, text_args: str
     ) -> OperationResult:
-        """Handle /guess <label> <@username or name or id> command."""
+        """Handle /guess command or direct word guess."""
         parts = text_args.strip().split(maxsplit=1)
+        if len(parts) == 1 and text_args.strip():
+            # Direct word guess for own photo card!
+            async with self._store.lock_for(group_chat_id):
+                res = self.session_manager.submit_direct_guess(
+                    group_chat_id=group_chat_id,
+                    guesser_id=guesser_id,
+                    guess_text=text_args.strip(),
+                )
+                await self.dispatch_notifications(res.notifications)
+                return res
+
         if len(parts) < 2:
             res = OperationResult(
                 ok=False,
@@ -260,12 +295,13 @@ class TelegramAdapter:
                     Notification(
                         channel="dm",
                         target_id=guesser_id,
-                        text="طريقة الاستخدام: /guess <رمز_الصورة> <اسم_اللاعب>",
+                        text="طريقة الاستخدام: /guess <كلمة_التخمين> أو /guess <رمز_الصورة> <اسم_اللاعب>",
                     )
                 ],
             )
             await self.dispatch_notifications(res.notifications)
             return res
+
 
         label, target_str = parts[0], parts[1].strip()
 

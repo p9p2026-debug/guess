@@ -37,6 +37,7 @@ class Player:
     user_id: int
     display_name: str
     photo_file_id: str | None = None
+    secret_word: str | None = None
     active: bool = True
 
 
@@ -49,12 +50,14 @@ class GameSession:
     state: GameState
     players: dict[int, Player]
     min_players: int = 2
-
     max_players: int = 15
     guessing_timeout_seconds: int = 300
     labels: dict[str, int] = field(default_factory=dict)
     guesses: dict[int, dict[str, int]] = field(default_factory=dict)
     created_at: float = 0.0
+    current_turn_user_id: int | None = None
+    turn_order: list[int] = field(default_factory=list)
+    pending_guess_user_id: int | None = None
 
 
 @dataclass

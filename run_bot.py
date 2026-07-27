@@ -178,7 +178,22 @@ class TelegramBotRunner:
             chat_id = message.get("chat", {}).get("id")
             data = callback.get("data", "")
 
-            if data == "join_game" and chat_id:
+            if data == "answer:yes" and chat_id:
+                res = await self.adapter.handle_answer(
+                    group_chat_id=chat_id, responder_id=user_id, answer_type="yes"
+                )
+                await self.answer_callback_query(cb_id, text="تم تسجيل إجابة: 🟢 نعم")
+            elif data == "answer:no" and chat_id:
+                res = await self.adapter.handle_answer(
+                    group_chat_id=chat_id, responder_id=user_id, answer_type="no"
+                )
+                await self.answer_callback_query(cb_id, text="تم تسجيل إجابة: 🔴 لا")
+            elif data == "guess_intent" and chat_id:
+                res = await self.adapter.handle_guess_intent(
+                    group_chat_id=chat_id, user_id=user_id
+                )
+                await self.answer_callback_query(cb_id, text="🎯 أرسل تخمينك بـ /guess الكلمة")
+            elif data == "join_game" and chat_id:
                 res = await self.adapter.handle_join(
                     group_chat_id=chat_id, user_id=user_id, display_name=display_name
                 )
@@ -188,6 +203,7 @@ class TelegramBotRunner:
                     else "تعذر الانضمام."
                 )
                 await self.answer_callback_query(cb_id, text=toast)
+
             elif data == "leave_game" and chat_id:
                 res = await self.adapter.handle_leave(group_chat_id=chat_id, user_id=user_id)
                 toast = "تم مغادرة اللعبة!" if res.ok else "أنت لست في اللعبة."
