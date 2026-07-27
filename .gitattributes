@@ -1,0 +1,10 @@
+# Normalise line endings in the repository to LF.
+#
+# timer_service.py arrived with CRLF from a Windows upload while every other
+# file used LF. Mixed endings make diffs noisy and make byte-level comparisons
+# (such as verifying the generated _PROJECT_BUNDLE.txt) report false conflicts.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.zip binary

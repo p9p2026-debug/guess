@@ -1,0 +1,24 @@
+# Render Blueprint: https://render.com/docs/infrastructure-as-code
+#
+# Deploy either by pointing Render at this file (Blueprints -> New Blueprint
+# Instance) or by creating the service manually with the same settings.
+services:
+  - type: web
+    name: spy-game-bot
+    runtime: python
+    plan: free
+    # No dependencies to install; this keeps the build step explicit and fast.
+    buildCommand: "python -m compileall -q photo_guess_game run_bot.py"
+    startCommand: "python run_bot.py"
+    healthCheckPath: /
+    envVars:
+      - key: BOT_TOKEN
+        # sync:false means Render prompts for the value and never stores it in
+        # this file. Paste the @BotFather token in the dashboard, not here.
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.13.4"
+      - key: ROUND_SECONDS
+        value: "300"
+      - key: LOG_LEVEL
+        value: "INFO"

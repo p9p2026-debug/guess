@@ -1,5 +1,20 @@
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+.Python
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+env/
 .pytest_cache/
-*.log
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Never commit secrets. BOT_TOKEN belongs in the Render dashboard.
 .env
+.env.*
+!.env.example

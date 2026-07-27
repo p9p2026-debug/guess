@@ -148,22 +148,28 @@ CATEGORIES = {
     ],
 }
 
-# Expand dataset dynamically to reach exactly 500 categorized entries
+# Build the flat library, keeping the first entry for any repeated secret word.
+# The spy's final guess is matched by ``word``, and distractors are filtered by
+# ``word``, so two entries sharing a word would make both operations ambiguous.
+_seen_words: set[str] = set()
+_DUPLICATE_WORDS: list[str] = []
 for category, items in CATEGORIES.items():
     for name, word in items:
+        if word in _seen_words:
+            _DUPLICATE_WORDS.append(word)
+            continue
+        _seen_words.add(word)
         LOCATIONS.append({"name": name, "word": word, "category": category})
 
-# Duplicate variations safely to ensure minimum 500 entries
-extra_index = 1
-base_len = len(LOCATIONS)
-while len(LOCATIONS) < 500:
-    sample = LOCATIONS[(extra_index - 1) % base_len]
-    LOCATIONS.append({
-        "name": f"{sample['name']} #{extra_index}",
-        "word": f"{sample['word']}_{extra_index}",
-        "category": sample["category"],
-    })
-    extra_index += 1
+# NOTE: an earlier revision padded this list up to exactly 500 entries by
+# cloning existing ones into synthetic variants ("مستشفى 🏥 #1" / "مستشفى_1").
+# Those variants were reachable as real secret words, so roughly a third of all
+# rounds were played on meaningless padding.  The library is now exactly the
+# curated set below -- fewer entries, all of them playable.
+assert LOCATIONS, "location library must not be empty"
+assert len({entry["word"] for entry in LOCATIONS}) == len(LOCATIONS), (
+    "duplicate secret words would make the spy's guess ambiguous"
+)
 
 
 def get_random_location() -> LocationEntry:

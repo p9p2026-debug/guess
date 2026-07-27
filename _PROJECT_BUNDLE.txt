@@ -1,0 +1,3699 @@
+==============================================================================
+ TELEGRAM SPY GAME BOT -- COMPLETE PROJECT BUNDLE
+ لعبة الجاسوس والكلمة السرية
+==============================================================================
+
+WHAT THIS FILE IS
+  Every source file of a working, deployable Telegram bot, concatenated into
+  one document. No repository access is needed. Recreate the tree exactly as
+  the path markers below describe, and it runs.
+
+HOW TO REBUILD
+  For each "===== FILE: <path> =====" marker, create that file at that exact
+  relative path and paste the block that follows it, up to the next marker.
+  Create the directories "photo_guess_game/" and "tests/" as needed.
+
+  Resulting tree:
+
+    <project-root>/
+      DEPLOY.md
+      render.yaml
+      requirements.txt          (intentionally empty of packages)
+      .gitignore
+      .env.example
+      run_bot.py                <- entry point
+      photo_guess_game/
+        __init__.py
+        models.py
+        locations.py
+        session_store.py
+        session_manager.py
+        timer_service.py
+        telegram_adapter.py
+        telegram_api.py
+      tests/
+        test_end_to_end.py
+        test_run_bot_boot.py
+        stub_telegram_server.py
+
+HARD REQUIREMENTS
+  * Python 3.10 or newer. Verified on 3.10 (compile) and 3.13 (full suite).
+  * ZERO third-party dependencies. The Telegram client is built on the standard
+    library. Do NOT add python-telegram-bot, httpx, aiogram, requests, or any
+    other package, and do not rewrite the transport to use one.
+  * The bot token is read from the BOT_TOKEN environment variable. Do NOT
+    hardcode it into any file. Set it in the hosting dashboard.
+
+VERIFY BEFORE DEPLOYING
+    python -m pytest tests/ -q      -> expect: 11 passed
+    python run_bot.py               -> expect: "authenticated as @<username>"
+
+DEPLOYMENT
+  Full instructions are the first block below (DEPLOY.md).
+
+  Short version for Render:
+    Build Command : python -m compileall -q photo_guess_game run_bot.py
+    Start Command : python run_bot.py
+    Health Check  : /
+    Env var       : BOT_TOKEN = <token from @BotFather>
+
+  Then in @BotFather: /setprivacy -> Disable
+  Without this the bot never receives /newgame in groups.
+
+KNOWN LIMITS (by design, do not "fix" silently)
+  * Sessions live in memory; a restart loses active games. SessionStore is the
+    single seam to swap for Redis/Postgres.
+  * Run exactly ONE instance. Two would both long-poll and Telegram would split
+    updates between them, breaking the per-group locks.
+
+==============================================================================
+ 17 files -- 3556 lines
+==============================================================================
+
+==============================================================================
+===== FILE: DEPLOY.md =====
+==============================================================================
+
+# Deploying the Spy Game bot to Render
+
+Hand this file to whoever (or whatever) does the deployment. Everything needed
+is here; no other document is required.
+
+## What this is
+
+A Telegram group game (لعبة الجاسوس والكلمة السرية). One player is secretly the
+spy and does not learn the secret location; everyone else receives it by DM.
+The group discusses, votes, and the spy gets one final multiple-choice guess.
+
+## Facts that shape the deployment
+
+- **Zero third-party dependencies.** The Bot API client is built on the standard
+  library (`urllib` + `asyncio`). `requirements.txt` is intentionally empty.
+  Nothing to install, nothing to pin, nothing to break on a release.
+- **Long polling, not webhooks.** No public URL or TLS setup is required. The
+  process clears any stale webhook at boot, since the two are mutually exclusive.
+- **Binds `$PORT` for a health check.** Render terminates a Web Service that
+  never listens on `$PORT`, so the process serves `GET /` returning 200 from a
+  daemon thread alongside the polling loop.
+- **Python 3.10 or newer.** Verified on 3.10 (compile) and 3.13 (full suite).
+- **State is in memory.** Sessions do not survive a restart or a second
+  instance. See "Limits" below.
+
+## Deploy
+
+### Option A — Blueprint (uses `render.yaml` in this repo)
+
+1. Render Dashboard → **Blueprints** → **New Blueprint Instance** → select this
+   repository.
+2. Render reads `render.yaml` and prompts for `BOT_TOKEN` (declared
+   `sync: false`, so it is never stored in the repo). Paste the token.
+3. **Create**.
+
+### Option B — Manual Web Service
+
+Render Dashboard → **New** → **Web Service** → connect this repository, then:
+
+| Setting | Value |
+| --- | --- |
+| Language / Runtime | Python 3 |
+| Build Command | `python -m compileall -q photo_guess_game run_bot.py` |
+| Start Command | `python run_bot.py` |
+| Health Check Path | `/` |
+| Instance Type | Free is sufficient |
+
+Then **Environment** → **Add Environment Variable**:
+
+| Key | Value | Required |
+| --- | --- | --- |
+| `BOT_TOKEN` | token from [@BotFather](https://t.me/BotFather) | **yes** |
+| `PYTHON_VERSION` | `3.13.4` | no |
+| `ROUND_SECONDS` | `300` | no |
+| `LOG_LEVEL` | `INFO` | no |
+
+The token is read from the environment and is deliberately not accepted from a
+source file. This repository is public, so a committed token is readable by
+anyone and Telegram revokes tokens it finds exposed. If the token was ever
+pasted into a file, a chat, or a commit, run `/revoke` in @BotFather and deploy
+with the replacement.
+
+### Verifying the deployment
+
+Logs should show, in order:
+
+```
+authenticated as @<your_bot_username>
+health endpoint listening on port 10000
+polling started (round length 300s)
+```
+
+If instead you see `getMe rejected the token`, the token is wrong or revoked.
+
+## Required BotFather settings
+
+The bot cannot work in groups without these:
+
+1. `/setprivacy` → select the bot → **Disable**
+   Group privacy mode must be off, otherwise the bot never receives `/newgame`.
+2. `/setjoingroups` → **Enable**
+3. Add the bot to the group. It does **not** need admin rights.
+
+## How players use it
+
+1. Add the bot to a group, send `/newgame`.
+2. Each player presses **➕ انضمام للعبة**.
+3. **Each player must open a private chat with the bot and send `/start` first.**
+   Telegram forbids a bot from initiating a DM. If any player has not done this,
+   role delivery fails and the round rolls back to the lobby with their name
+   listed — by design, so a round is never played with a missing role.
+4. The host presses **🚀 بدء اللعبة**.
+
+Commands: `/newgame`, `/cancel` (host only), `/help`.
+
+## Limits to be aware of
+
+- **In-memory state.** A restart, redeploy, or crash loses all active games.
+  Render's free tier also idles a service after inactivity. For durable
+  sessions, `SessionStore` is the single place to swap for Redis or Postgres.
+- **Single instance only.** Two instances would both long-poll and Telegram
+  would split updates between them, so per-group locks would not hold. Do not
+  scale beyond one instance without moving state out of the process.
+- **No cross-restart timers.** Round deadlines live in the event loop.
+
+## Running locally
+
+```bash
+export BOT_TOKEN='123456789:AA...'   # or copy .env.example to .env
+python run_bot.py
+```
+
+## Tests
+
+```bash
+python -m pytest tests/ -q          # 11 tests
+python tests/test_end_to_end.py     # also runs without pytest
+```
+
+`tests/test_end_to_end.py` drives the real adapter/manager/timer wiring with a
+fake HTTP boundary. `tests/test_run_bot_boot.py` launches `run_bot.py` as a real
+subprocess against a stub Bot API and asserts it authenticates, polls, routes
+updates, serves the health endpoint, and exits 0 on `SIGTERM`.
+
+==============================================================================
+===== FILE: render.yaml =====
+==============================================================================
+
+# Render Blueprint: https://render.com/docs/infrastructure-as-code
+#
+# Deploy either by pointing Render at this file (Blueprints -> New Blueprint
+# Instance) or by creating the service manually with the same settings.
+services:
+  - type: web
+    name: spy-game-bot
+    runtime: python
+    plan: free
+    # No dependencies to install; this keeps the build step explicit and fast.
+    buildCommand: "python -m compileall -q photo_guess_game run_bot.py"
+    startCommand: "python run_bot.py"
+    healthCheckPath: /
+    envVars:
+      - key: BOT_TOKEN
+        # sync:false means Render prompts for the value and never stores it in
+        # this file. Paste the @BotFather token in the dashboard, not here.
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.13.4"
+      - key: ROUND_SECONDS
+        value: "300"
+      - key: LOG_LEVEL
+        value: "INFO"
+
+==============================================================================
+===== FILE: requirements.txt =====
+==============================================================================
+
+# This project intentionally has zero third-party dependencies.
+#
+# The Telegram Bot API client (photo_guess_game/telegram_api.py) is built on the
+# standard library (urllib + asyncio), so there is nothing to install, nothing
+# to pin, and no dependency that can break on a future release.
+#
+# The file is kept because Render's Python runtime looks for it to detect a
+# Python service. Leave it empty unless a real dependency is added.
+
+==============================================================================
+===== FILE: .gitignore =====
+==============================================================================
+
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Never commit secrets. BOT_TOKEN belongs in the Render dashboard.
+.env
+.env.*
+!.env.example
+
+==============================================================================
+===== FILE: .env.example =====
+==============================================================================
+
+# Copy to .env for local runs (.env is gitignored), or set these in the
+# Render dashboard under Environment. Never commit real values.
+
+# Required. From @BotFather.
+BOT_TOKEN=123456789:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# Optional. Discussion length in seconds before the round times out.
+ROUND_SECONDS=300
+
+# Optional. Health-check port. Render injects this automatically.
+PORT=10000
+
+# Optional. DEBUG, INFO, WARNING, ERROR.
+LOG_LEVEL=INFO
+
+==============================================================================
+===== FILE: run_bot.py =====
+==============================================================================
+
+#!/usr/bin/env python3
+"""Entry point for the Telegram Spy Game bot (لعبة الجاسوس والكلمة السرية).
+
+Runs long polling against the Bot API with no third-party dependencies, plus a
+tiny HTTP health endpoint so the process can be hosted as a Render Web Service
+(Render terminates any web service that never binds ``$PORT``).
+
+Configuration (environment variables):
+    BOT_TOKEN   required. Bot token from @BotFather.
+    PORT        optional. Health-check port; Render injects this.
+    ROUND_SECONDS
+                optional. Discussion length in seconds (default 300).
+    LOG_LEVEL   optional. Python log level name (default INFO).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+import os
+import signal
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, Coroutine
+
+from photo_guess_game.session_manager import SessionManager
+from photo_guess_game.session_store import SessionStore
+from photo_guess_game.telegram_adapter import TelegramAdapter
+from photo_guess_game.telegram_api import (
+    DEFAULT_BASE_URL,
+    LONG_POLL_SECONDS,
+    TelegramAPI,
+)
+from photo_guess_game.timer_service import TimerService
+
+logger = logging.getLogger("spygame")
+
+HELP_TEXT = (
+    "🕵️ <b>لعبة الجاسوس والكلمة السرية</b>\n\n"
+    "<b>الأوامر:</b>\n"
+    "/newgame — فتح لوبي لعبة جديدة في المجموعة\n"
+    "/cancel — إلغاء اللعبة الحالية (المنشئ فقط)\n"
+    "/help — عرض هذه الرسالة\n\n"
+    "<b>كيف تلعبون:</b>\n"
+    "1️⃣ أضف البوت لمجموعة وأرسل /newgame\n"
+    "2️⃣ كل لاعب يضغط <b>➕ انضمام للعبة</b>\n"
+    "3️⃣ <b>مهم:</b> كل لاعب يجب أن يبدأ محادثة خاصة مع البوت أولاً، "
+    "وإلا تعذّر إرسال الكلمة السرية له وستُلغى الجولة\n"
+    "4️⃣ المنشئ يضغط <b>🚀 بدء اللعبة</b>"
+)
+
+PRIVATE_WELCOME = (
+    "✅ <b>تم تفعيل المحادثة الخاصة!</b>\n\n"
+    "أصبح بإمكاني إرسال كلمتك السرية هنا عند بدء أي جولة.\n"
+    "الآن ارجع إلى المجموعة وانضم للعبة. 🕵️"
+)
+
+
+# ----------------------------------------------------------------------
+# Health endpoint
+# ----------------------------------------------------------------------
+class _HealthHandler(BaseHTTPRequestHandler):
+    """Answers Render's health probe and nothing else."""
+
+    def do_GET(self) -> None:  # noqa: N802 - stdlib naming
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"spy game bot: polling\n")
+
+    def log_message(self, *_args: Any) -> None:
+        """Silence the default per-request stderr logging."""
+
+
+def start_health_server(port: int) -> ThreadingHTTPServer:
+    """Serve the health endpoint from a daemon thread."""
+    server = ThreadingHTTPServer(("0.0.0.0", port), _HealthHandler)
+    threading.Thread(
+        target=server.serve_forever, name="health", daemon=True
+    ).start()
+    logger.info("health endpoint listening on port %d", port)
+    return server
+
+
+# ----------------------------------------------------------------------
+# Update routing
+# ----------------------------------------------------------------------
+class BotRunner:
+    """Wires the game components to the Bot API and pumps the update loop."""
+
+    def __init__(
+        self, api: TelegramAPI, *, round_seconds: int, bot_username: str
+    ) -> None:
+        self._api = api
+        self._store = SessionStore()
+        self._stopping = asyncio.Event()
+        # Strong references to fire-and-forget tasks; without this the event
+        # loop is free to garbage-collect a task mid-flight.
+        self._background: set[asyncio.Task[Any]] = set()
+
+        loop = asyncio.get_running_loop()
+        self._timers = TimerService(
+            scheduler=lambda delay, callback: loop.call_later(delay, callback),
+            session_lookup=lambda key: self._store.get(key.group_chat_id),
+        )
+        self._manager = SessionManager(
+            self._store,
+            timer_service=self._timers,
+            timeout_dispatcher=self._on_timer_fired,
+            round_seconds=round_seconds,
+        )
+        self._adapter = TelegramAdapter(
+            self._store,
+            session_manager=self._manager,
+            timer_service=self._timers,
+            send_message_fn=api.send_message,
+            edit_message_fn=api.edit_message_text,
+            edit_markup_fn=api.edit_message_reply_markup,
+            bot_username=bot_username,
+        )
+        self._offset: int | None = None
+
+    # -- task plumbing -------------------------------------------------
+    def _spawn(self, coro: Coroutine[Any, Any, Any]) -> None:
+        task = asyncio.create_task(coro)
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+
+    def _on_timer_fired(self, kind: str, group_chat_id: int) -> None:
+        """Bridge a synchronous timer callback into a lock-guarded coroutine."""
+        self._spawn(self._resolve_timeout(kind, group_chat_id))
+
+    async def _resolve_timeout(self, kind: str, group_chat_id: int) -> None:
+        async with self._store.lock_for(group_chat_id):
+            if kind == "half_elapsed":
+                res = self._manager.half_time_reminder(group_chat_id)
+            else:
+                res = self._manager.enter_reveal(group_chat_id)
+        if res.ok and res.notifications:
+            await self._adapter.dispatch_notifications(res.notifications)
+
+    # -- routing -------------------------------------------------------
+    @staticmethod
+    def _display_name(user: dict[str, Any]) -> str:
+        name = " ".join(
+            part for part in (user.get("first_name"), user.get("last_name")) if part
+        ).strip()
+        return name or user.get("username") or f"user {user.get('id')}"
+
+    async def _handle_message(self, message: dict[str, Any]) -> None:
+        chat = message.get("chat") or {}
+        user = message.get("from") or {}
+        chat_id = chat.get("id")
+        user_id = user.get("id")
+        if chat_id is None or user_id is None:
+            return
+
+        text = (message.get("text") or "").strip()
+        is_private = chat.get("type") == "private"
+
+        if is_private:
+            # Any private message proves the bot can DM this user, which is the
+            # precondition the round-start delivery check depends on.
+            self._adapter.mark_user_dm_ready(user_id)
+            if text.startswith("/start") or text.startswith("/help"):
+                await self._api.send_message(chat_id, PRIVATE_WELCOME)
+            return
+
+        if not text.startswith("/"):
+            return
+
+        command = text.split()[0].split("@")[0].lower()
+        if command in ("/newgame", "/start", "/game"):
+            await self._adapter.handle_newgame(
+                chat_id, user_id, self._display_name(user)
+            )
+        elif command in ("/cancel", "/cancelgame", "/endgame"):
+            await self._adapter.handle_cancelgame(chat_id, user_id)
+        elif command == "/help":
+            await self._api.send_message(chat_id, HELP_TEXT)
+
+    async def _handle_callback(self, query: dict[str, Any]) -> None:
+        query_id = query.get("id")
+        user = query.get("from") or {}
+        user_id = user.get("id")
+        message = query.get("message") or {}
+        chat = message.get("chat") or {}
+        chat_id = chat.get("id")
+        data = query.get("data") or ""
+
+        if query_id is None or user_id is None or chat_id is None:
+            return
+
+        display_name = self._display_name(user)
+        res = None
+
+        try:
+            if data == "join_game":
+                res = await self._adapter.handle_join(chat_id, user_id, display_name)
+            elif data == "leave_game":
+                res = await self._adapter.handle_leave(chat_id, user_id)
+            elif data == "start_game":
+                res = await self._adapter.handle_startgame(chat_id, user_id)
+            elif data == "cancel_game":
+                res = await self._adapter.handle_cancelgame(chat_id, user_id)
+            elif data == "refresh_panel":
+                res = await self._adapter.handle_refresh_panel(chat_id)
+            elif data == "start_voting":
+                res = await self._adapter.handle_start_voting(chat_id)
+            elif data == "spy_guess_menu":
+                res = await self._adapter.handle_spy_guess_menu(chat_id, user_id)
+            elif data.startswith("vote:"):
+                target = self._parse_int(data.partition(":")[2])
+                if target is not None:
+                    res = await self._adapter.handle_spy_vote(chat_id, user_id, target)
+            elif data.startswith("spy_guess:"):
+                index = self._parse_int(data.partition(":")[2])
+                if index is not None:
+                    res = await self._adapter.handle_spy_guess_option(
+                        chat_id, user_id, index
+                    )
+        except Exception:
+            logger.exception("callback %r failed in chat %s", data, chat_id)
+
+        # Telegram keeps the button spinner alive until the query is answered,
+        # so this must happen on every path including failures.
+        alert_text = res.alert_text if res is not None else None
+        show_alert = bool(res.show_alert) if res is not None else False
+        await self._api.answer_callback_query(
+            query_id, alert_text, show_alert=show_alert
+        )
+
+    @staticmethod
+    def _parse_int(raw: str) -> int | None:
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
+    async def _handle_update(self, update: dict[str, Any]) -> None:
+        if "callback_query" in update:
+            await self._handle_callback(update["callback_query"])
+        elif "message" in update:
+            await self._handle_message(update["message"])
+
+    # -- main loop -----------------------------------------------------
+    async def run(self) -> None:
+        """Poll until stopped, dispatching each update concurrently."""
+        while not self._stopping.is_set():
+            response = await self._api.get_updates(
+                self._offset, timeout=LONG_POLL_SECONDS
+            )
+            if not response.get("ok"):
+                logger.error("getUpdates failed: %s", response.get("description"))
+                await asyncio.sleep(3)
+                continue
+
+            for update in response.get("result", []):
+                update_id = update.get("update_id")
+                if isinstance(update_id, int):
+                    # Advance the offset before handling so a handler crash can
+                    # never turn one poisoned update into an infinite loop.
+                    self._offset = update_id + 1
+                self._spawn(self._guarded(update))
+
+            self._store.cleanup_expired()
+
+    async def _guarded(self, update: dict[str, Any]) -> None:
+        try:
+            await self._handle_update(update)
+        except Exception:
+            logger.exception("failed to handle update %s", update.get("update_id"))
+
+    def request_stop(self) -> None:
+        self._stopping.set()
+
+    async def shutdown(self) -> None:
+        """Release timers and let in-flight handlers finish."""
+        cancelled = self._timers.shutdown()
+        logger.info("cancelled %d pending timer(s)", cancelled)
+        if self._background:
+            await asyncio.wait(set(self._background), timeout=10)
+
+
+# ----------------------------------------------------------------------
+# Bootstrap
+# ----------------------------------------------------------------------
+def _read_token() -> str:
+    token = (os.environ.get("BOT_TOKEN") or "").strip()
+    if not token:
+        sys.stderr.write(
+            "\nBOT_TOKEN is not set.\n\n"
+            "On Render: Dashboard -> your service -> Environment -> Add\n"
+            "  Key   = BOT_TOKEN\n"
+            "  Value = the token from @BotFather\n\n"
+            "Locally:  export BOT_TOKEN='123456789:AA...'\n\n"
+            "The token is read from the environment on purpose: this repository\n"
+            "is public, and a committed token can be used by anyone who reads it.\n\n"
+        )
+        raise SystemExit(2)
+    return token
+
+
+async def _amain() -> int:
+    logging.basicConfig(
+        level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+    )
+
+    token = _read_token()
+    round_seconds = int(os.environ.get("ROUND_SECONDS", "300"))
+
+    # Overridable so the boot path can be exercised against a local stub in
+    # tests; production never sets it.
+    base_url = os.environ.get("TELEGRAM_API_BASE", DEFAULT_BASE_URL)
+    api = TelegramAPI(token, base_url=base_url)
+    me = await api.get_me()
+    if not me.get("ok"):
+        logger.error(
+            "getMe rejected the token: %s. If it was ever committed or shared, "
+            "revoke it with @BotFather (/revoke) and set the new one.",
+            me.get("description"),
+        )
+        return 1
+
+    username = (me.get("result") or {}).get("username", "unknown")
+    logger.info("authenticated as @%s", username)
+
+    # Long polling and a webhook are mutually exclusive; clear any stale one.
+    await api.delete_webhook()
+
+    runner = BotRunner(api, round_seconds=round_seconds, bot_username=username)
+
+    port_value = os.environ.get("PORT")
+    health_server = start_health_server(int(port_value)) if port_value else None
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(sig, runner.request_stop)
+
+    logger.info("polling started (round length %ds)", round_seconds)
+    try:
+        await runner.run()
+    finally:
+        logger.info("shutting down")
+        await runner.shutdown()
+        if health_server is not None:
+            health_server.shutdown()
+    return 0
+
+
+def main() -> int:
+    try:
+        return asyncio.run(_amain())
+    except KeyboardInterrupt:
+        return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+==============================================================================
+===== FILE: photo_guess_game/__init__.py =====
+==============================================================================
+
+"""Telegram Spy Game (لعبة الجاسوس والكلمة السرية).
+
+Layering, innermost first:
+
+``models``          plain dataclasses; no I/O, no imports from siblings.
+``locations``       the curated secret-word library.
+``session_store``   in-memory session storage, per-group locks, generations.
+``session_manager`` the rules engine. Every method is synchronous and returns
+                    an ``OperationResult`` describing what should be sent; it
+                    never performs I/O itself.
+``timer_service``   generation-bound timer registry over an injected scheduler.
+``telegram_adapter``the I/O boundary. Runs a decision under the group lock,
+                    then performs every network send outside the lock.
+``telegram_api``    stdlib-only Bot API client (no third-party dependencies).
+
+The package name is historical: this codebase began as a photo-guessing game.
+The photo-specific components (score/guess trackers, photo labels) were removed
+once the game became the spy game; see git history if they are ever needed.
+"""
+
+==============================================================================
+===== FILE: photo_guess_game/models.py =====
+==============================================================================
+
+"""Core data types and models for Telegram Spy Game."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Literal
+
+
+@dataclass(frozen=True, slots=True)
+class SessionKey:
+    """Generation-bound identity for a session (group_chat_id + generation)."""
+
+    group_chat_id: int
+    generation: int
+
+
+class RoundPhase(Enum):
+    """Explicit round sub-phases used by generation-bound components."""
+
+    LOBBY = "lobby"
+    DELIVERING = "delivering"
+    DISCUSSION = "discussion"
+    VOTING = "voting"
+    SPY_GUESS = "spy_guess"
+
+
+class GameState(Enum):
+    """Explicit state machine states for GameSession.
+
+    ``GUESSING`` is the single post-start playing state.  Voting and the spy's
+    final guess are tracked as sub-flags (``voting_active`` /
+    ``spy_guessing_active``) on the session rather than as separate top-level
+    states, so a game stays observably in ``GUESSING`` while a ballot is open.
+    """
+
+    LOBBY = "lobby"
+    DEALING = "dealing"
+    GUESSING = "guessing"
+    DISCUSSION = "discussion"
+    VOTING = "voting"
+    SPY_LAST_GUESS = "spy_last_guess"
+    REVEAL = "reveal"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+
+
+#: States after which a session accepts no further transitions.  Kept here (not
+#: in session_store) so ``GameSession.terminal`` needs no cross-module import.
+TERMINAL_STATES: frozenset[GameState] = frozenset(
+    {GameState.COMPLETED, GameState.CANCELLED}
+)
+
+#: GameState -> RoundPhase projection used by generation-bound timer guards.
+#: ``GUESSING`` is refined at runtime via the voting/spy sub-flags.
+_PHASE_BY_STATE: dict[GameState, RoundPhase] = {
+    GameState.LOBBY: RoundPhase.LOBBY,
+    GameState.DEALING: RoundPhase.DELIVERING,
+    GameState.GUESSING: RoundPhase.DISCUSSION,
+    GameState.DISCUSSION: RoundPhase.DISCUSSION,
+    GameState.VOTING: RoundPhase.VOTING,
+    GameState.SPY_LAST_GUESS: RoundPhase.SPY_GUESS,
+}
+
+
+@dataclass
+class Player:
+    """A Telegram user participating in a GameSession."""
+
+    user_id: int
+    display_name: str
+    joined_at: float = 0.0
+    dm_ready: bool = False
+    active: bool = True
+    is_spy: bool = False
+    secret_word: str | None = None
+
+
+@dataclass
+class GameSession:
+    """An active or historical Spy Game session bound to a single group chat."""
+
+    game_id: str
+    group_chat_id: int
+    host_id: int
+    state: GameState
+    players: dict[int, Player]
+    created_at: float = 0.0
+    last_activity_at: float = 0.0
+    round_number: int = 1
+    vote_round: int = 1
+    control_message_id: int | None = None
+    secret_location_name: str | None = ""
+    secret_location_word: str | None = ""
+    secret_category: str = ""
+    spy_user_id: int | None = None
+    votes: dict[int, int] = field(default_factory=dict)  # voter_id -> target_user_id
+    eligible_vote_targets: list[int] = field(default_factory=list)
+    #: Secret words offered on the spy's final-guess ballot, generated once per
+    #: round so reopening the menu cannot reroll easier distractors.
+    spy_guess_options: list[str] = field(default_factory=list)
+    #: Display labels parallel to ``spy_guess_options`` (same index order).
+    spy_guess_labels: list[str] = field(default_factory=list)
+    spy_guess_attempted: bool = False
+    voting_active: bool = False
+    spy_guessing_active: bool = False
+    guessing_timeout_seconds: int = 300
+    min_players: int = 2
+    max_players: int = 15
+    #: Monotonic generation for this group chat.  A new session in the same
+    #: group always gets a higher generation, so timers and callbacks issued by
+    #: a previous game can be rejected instead of mutating the new one.
+    generation: int = 1
+    #: Bumped on every committed state change; lets a timer scheduled before a
+    #: transition detect that it is stale.
+    revision: int = 0
+
+    @property
+    def session_key(self) -> SessionKey:
+        """Generation-bound identity used by TimerService and callback guards."""
+        return SessionKey(self.group_chat_id, self.generation)
+
+    @property
+    def terminal(self) -> bool:
+        """Whether this session accepts no further transitions."""
+        return self.state in TERMINAL_STATES
+
+    @property
+    def phase(self) -> RoundPhase | None:
+        """Current round sub-phase, or ``None`` once terminal/revealing."""
+        if self.state is GameState.GUESSING:
+            if self.spy_guessing_active:
+                return RoundPhase.SPY_GUESS
+            if self.voting_active:
+                return RoundPhase.VOTING
+            return RoundPhase.DISCUSSION
+        return _PHASE_BY_STATE.get(self.state)
+
+    def touch(self) -> int:
+        """Bump and return the revision counter after a committed change."""
+        self.revision += 1
+        return self.revision
+
+
+@dataclass
+class Notification:
+    """Outbound Telegram message or update instruction."""
+
+    channel: Literal["group", "dm"]
+    target_id: int
+    text: str
+    buttons: list[list[dict[str, str]]] | None = None
+    edit_message_id: int | None = None
+    disable_previous_message_id: int | None = None
+
+
+@dataclass
+class OperationResult:
+    """Synchronous outcome of a session decision."""
+
+    ok: bool
+    reason: str | None = None
+    alert_text: str | None = None
+    show_alert: bool = False
+    notifications: list[Notification] = field(default_factory=list)
+    session: GameSession | None = None
+
+==============================================================================
+===== FILE: photo_guess_game/locations.py =====
+==============================================================================
+
+"""500 Categorized Arabic Secret Locations & Objects Library for Spy Game."""
+
+import random
+from typing import TypedDict
+
+
+class LocationEntry(TypedDict):
+    name: str
+    word: str
+    category: str
+
+
+# Categorized library of 500 secret words
+LOCATIONS: list[LocationEntry] = []
+
+CATEGORIES = {
+    "أماكن": [
+        ("مستشفى 🏥", "مستشفى"), ("مطار ✈️", "مطار"), ("مدرسة 🏫", "مدرسة"),
+        ("مطعم 🍕", "مطعم"), ("سينما 🎬", "سينما"), ("ملعب ⚽", "ملعب"),
+        ("شاطئ 🏖️", "شاطئ"), ("متحف 🏛️", "متحف"), ("مخبز 🥐", "مخبز"),
+        ("فندق 🏨", "فندق"), ("سوبرماركت 🛒", "سوبرماركت"), ("جيم 🏋️", "جيم"),
+        ("سيرك 🎪", "سيرك"), ("محطة إطفاء 🚒", "إطفاء"), ("مركز شرطة 🚓", "شرطة"),
+        ("قلعة 🏰", "قلعة"), ("صحراء 🐪", "صحراء"), ("ملاهي 🎡", "ملاهي"),
+        ("كافيه ☕", "كافيه"), ("صالون حلاقة 💈", "حلاق"), ("صيدلية 💊", "صيدلية"),
+        ("مكتبة 📚", "مكتبة"), ("مسبح 🏊", "مسبح"), ("محطة فضاء 🌌", "محطة فضاء"),
+        ("حقل نفط 🛢️", "حقل نفط"), ("منتجع تزلج 🎿", "تزلج"), ("بركان 🌋", "بركان"),
+        ("محكمة 🏛️", "محكمة"), ("بنك 🏦", "بنك"), ("مسرح 🎭", "مسرح"),
+        ("قاعدة صواريخ 🚀", "قاعدة صواريخ"), ("مول تجاري 🏬", "مول"), ("مصنع 🏭", "مصنع"),
+        ("مزرعة 🌾", "مزرعة"), ("مخيم 🏕️", "مخيم"), ("كهف 🌋", "كهف"),
+        ("قمة جبل 🏔️", "جبل"), ("حلبة سباق 🏎️", "حلبة سباق"), ("محطة مترو 🚇", "مترو"),
+        ("واحة 🏜️", "واحة"), ("ميناء سفن ⛵", "ميناء"), ("قصر ملوكي 🏰", "قصر"),
+        ("مسجد 🕌", "مسجد"), ("كنيسة ⛪", "كنيسة"), ("ناطحة سحاب 🏢", "ناطحة سحاب"),
+        ("حديقة حيوان 🦁", "حديقة حيوان"), ("ورشة سيارات 🔧", "ورشة سيارات"),
+        ("محطة بنزين ⛽", "محطة بنزين"), ("مغسلة سيارات 🧼", "مغسلة سيارات"),
+        ("معرض فنون 🎨", "معرض فنون"), ("محطة قطار 🚉", "محطة قطار"),
+        ("غواصة 🌊", "غواصة"), ("منارة 🗼", "منارة"), ("سجن 🚔", "سجن"),
+        ("معهد موسيقى 🎼", "معهد موسيقى"), ("مختبر علمي 🧪", "مختبر علمي"),
+        ("قاعة أفراح 💍", "قاعة أفراح"), ("ملعب تنس 🎾", "ملعب تنس"),
+        ("حلبة ملاكمة 🥊", "حلبة ملاكمة"), ("مشتل زهور 🌺", "مشتل زهور"),
+        ("محمية طبيعية 🌲", "محمية طبيعية"), ("مرصد فلكي 🔭", "مرصد فلكي"),
+        ("مدرج روماني 🏛️", "مدرج روماني"), ("منجم ذهب ⛏️", "منجم ذهب"),
+        ("مخزن أسلحة 💣", "مخزن أسلحة"), ("مكتب بريد 📮", "مكتب بريد"),
+        ("صالة بولينج 🎳", "صالة بولينج"), ("مضمار خيل 🐎", "مضمار خيل"),
+    ],
+    "أطعمة ومشروبات": [
+        ("برجر 🍔", "برجر"), ("بيتزا 🍕", "بيتزا"), ("شاورما 🥙", "شاورما"),
+        ("كبسة 🍲", "كبسة"), ("منسف 🍖", "منسف"), ("سوشي 🍣", "سوشي"),
+        ("كباب 🍢", "كباب"), ("فلافل 🧆", "فلافل"), ("حميص 🥗", "حمص"),
+        ("تبولة 🥗", "تبولة"), ("فتوش 🥗", "فتوش"), ("كبة 🧆", "كبة"),
+        ("دجاج مقلي 🍗", "دجاج مقلي"), ("ستيك لحم 🥩", "ستيك"), ("شربة 🍜", "شوربة"),
+        ("معكرونة 🍝", "معكرونة"), ("لازانيا 🧀", "لازانيا"), ("طاجن 🍲", "طاجن"),
+        ("محشي 🍆", "محشي"), ("ورق عنب 🍃", "ورق عنب"), ("ملوخية 🌿", "ملوخية"),
+        ("سمك مشوي 🐟", "سمك مشوي"), ("جمبري 🦐", "جمبري"), ("سلطة قيصر 🥗", "سلطة قيصر"),
+        ("فطيرة تفاح 🥧", "فطيرة تفاح"), ("كيك شوكولاتة 🎂", "كيك"), ("آيس كريم 🍦", "آيس كريم"),
+        ("دونات 🍩", "دونات"), ("بان كيك 🥞", "بان كيك"), ("وافل 🧇", "وافل"),
+        ("بستلا 🥐", "كرواسون"), ("بقلاوة 🥮", "بقلاوة"), ("كنافة 🍮", "كنافة"),
+        ("بوسة 🍧", "بوظة"), ("عصير برتقال 🍊", "عصير برتقال"), ("قهوة عربية ☕", "قهوة عربية"),
+        ("شاي بنعناع 🍵", "شاي"), ("موهيتو 🍹", "موهيتو"), ("مشروب غازي 🥤", "مشروب غازي"),
+        ("كوكتيل فواكه 🍹", "كوكتيل"), ("حليب بالشكولاتة 🥛", "حليب شوكولاتة"),
+        ("سحلب ☕", "سحلب"), ("تمر هندي 🥤", "تمر هندي"), ("عصير قصب 🥤", "عصير قصب"),
+        ("فول مدمس 🫘", "فول"), ("شكشوكة 🍳", "شكشوكة"), ("مطبك سمك 🐟", "مطابق"),
+        ("برياني 🍲", "برياني"), ("بخاري 🍛", "بخاري"), ("مظبي 🍗", "مظبي"),
+        ("مندي 🍖", "مندي"), ("ثريد 🍲", "ثريد"), ("مرقوق 🍲", "مرقوق"),
+        ("جريش 🥣", "جريش"), ("سليق 🥣", "سليق"), ("مصلي 🥩", "مصلي"),
+        ("كبسة حاشي 🐫", "كبسة حاشي"), ("مطازيز 🍲", "مطازيز"), ("حنيني 🍯", "حنيني"),
+        ("عريكة 🍯", "عريكة"), ("معصوب 🍌", "معصوب"), ("لقيمات 🍩", "لقيمات"),
+        ("بلح الشام 🥮", "بلح الشام"), ("أم علي 🍮", "أم علي"), ("رز بالحليب 🍧", "رز بالحليب"),
+        ("مهلبية 🍮", "مهلبية"), ("بسبوسة 🍰", "بسبوسة"), ("غريبة 🍪", "غريبة"),
+        ("معمول 🥮", "معمول"), ("راحة حلقوم 🍬", "حلقوم"), ("كرك ☕", "كرك"),
+    ],
+    "حيوانات": [
+        ("أسد 🦁", "أسد"), ("نمر 🐅", "نمر"), ("فهد 🐆", "فهد"),
+        ("فيل 🐘", "فيل"), ("زرافة 🦒", "زرافة"), ("وحيد القرن 🦏", "وحيد القرن"),
+        ("فرس النهر 🦛", "فرس النهر"), ("دب قطبي 🐻‍❄️", "دب قطبي"), ("دب بني 🐻", "دب بني"),
+        ("باندا 🐼", "باندا"), ("ذئب 🐺", "ذئب"), ("ثعلب 🦊", "ثعلب"),
+        ("ضبع 🦡", "ضبع"), ("قرد 🐒", "قرد"), ("غوريلا 🦍", "غوريلا"),
+        ("شامبانزي 🦧", "شامبانزي"), ("ارنب 🐰", "أرنب"), ("سنجاب 🐿️", "سنجاب"),
+        ("قنفذ 🦔", "قنفذ"), ("كوالا 🐨", "كوالا"), ("كنغر 🦘", "كنغر"),
+        ("جمل 🐪", "جمل"), ("حصان 🐎", "حصان"), ("حمار وحشي 🦓", "حمار وحشي"),
+        ("بقرة 🐄", "بقرة"), ("خروف 🐑", "خروف"), ("ماعز 🐐", "ماعز"),
+        ("خنزير بري 🐗", "خنزير بري"), ("غزال 🦌", "غزال"), ("ثور 🐂", "ثور"),
+        ("حوت 🐋", "حوت"), ("دلفين 🐬", "دلفين"), ("قرش 🦈", "قرش"),
+        ("أخطبوط 🐙", "أخطبوط"), ("قنديل البحر 🪼", "قنديل البحر"), ("سلطعون 🦀", "سلطعون"),
+        ("سلحفاة 🐢", "سلحفاة"), ("تمساح 🐊", "تمساح"), ("أفعى 🐍", "أفعى"),
+        ("ضفدع 🐸", "ضفدع"), ("صقر 🦅", "صقر"), ("نسر 🦅", "نسر"),
+        ("بومة 🦉", "بومة"), ("الببغاء 🦜", "ببغاء"), ("بطريق 🐧", "بطريق"),
+        ("نعامة 🦩", "نعامة"), ("طاووس 🦚", "طاووس"), ("فلامنغو 🦩", "فلامنغو"),
+        ("بطة 🦆", "بطة"), ("وزة 🪿", "وزة"), ("دجاجة 🐔", "دجاجة"),
+        ("ديك رومي 🦃", "ديك رومي"), ("خفاش 🦇", "خفاش"), ("نحلة 🐝", "نحلة"),
+        ("فراشة 🦋", "فراشة"), ("عنكبوت 🕷️", "عنكبوت"), ("عقرب 🦂", "عقرب"),
+        ("نملة 🐜", "نملة"), ("صرصور شرات", "صرصور"), ("سحلية 🦎", "سحلية"),
+        ("تنين كومودو 🐉", "تنين كومودو"), ("سمك القرش الأبيض 🦈", "قرش أبيض"),
+        ("فقمة 🦭", "فقمة"), ("أسد البحر 🦭", "أسد البحر"), ("قندس 🦫", "قندس"),
+        ("حيوان المرموط 🐿️", "مرموط"), ("راكون 🦝", "راكون"), ("قندس الماء 🦦", "قندس"),
+    ],
+    "أدوات وتقنية": [
+        ("لابتوب 💻", "لابتوب"), ("هاتف ذكي 📱", "جوال"), ("تابلت 📱", "تابلت"),
+        ("ساعة ذكية ⌚", "ساعة ذكية"), ("سماعات بلوتوث 🎧", "سماعات"), ("كاميرا 📷", "كاميرا"),
+        ("طابعة 🪟", "طابعة"), ("شاشة عرض 🖥️", "شاشة"), ("تلفزيون 📺", "تلفزيون"),
+        ("بلايستيشن 🎮", "بلايستيشن"), ("إكس بوكس 🎮", "إكس بوكس"), ("درون 🚁", "درون"),
+        ("نظارة واقع افتراضي 🥽", "واقع افتراضي"), ("شاحن متنقل 🔋", "باور بانك"),
+        ("ميكروفون 🎙️", "ميكروفون"), ("مكبر صوت 🔊", "سبيكر"), ("مكيف هواء ❄️", "مكيف"),
+        ("مروحة 🌬️", "مروحة"), ("مكواة 🧺", "مكواة"), ("غسالة ملابس 🧺", "غسالة"),
+        ("جلاية صحون 🍽️", "جلاية صحون"), ("ميكروويف ♨️", "ميكروويف"), ("فرن كهربائي 🍳", "فرن"),
+        ("خلاط طعام 🥣", "خلاط"), ("عصارة فواكه 🍹", "عصارة"), ("ماكينة قهوة ☕", "ماكينة قهوة"),
+        ("مكنسة كهربائية 🧹", "مكنسة كهربائية"), ("روبوت تنظيف 🤖", "روبوت تنظيف"),
+        ("بوصلة 🧭", "بوصلة"), ("مجهر 🔬", "مجهر"), ("تلسكوب 🔭", "تلسكوب"),
+        ("مقياس حرارة 🌡️", "ميزان حرارة"), ("ميزان إلكتروني ⚖️", "ميزان"),
+        ("آلة حاسبة 🧮", "آلة حاسبة"), ("مقص ✂️", "مقص"), ("مفك براغي 🪛", "مفك"),
+        ("مطرقة 🔨", "مطرقة"), ("منشار 🪚", "منشار"), ("مفتاح إنجليزي 🔧", "مفتاح wrench"),
+        ("شريط قياس 📏", "متر قياس"), ("شاحن هاتف 🔌", "شاحن"), ("قابس كهرباء 🔌", "قابس"),
+        ("بطارية 🔋", "بطارية"), ("مصباح يدوي 🔦", "كشاف"), ("طائرة دراجة 🛴", "سكوتر ذكي"),
+    ],
+    "معالم عالمية وتاريخية": [
+        ("الأهرامات 🔺", "الأهرامات"), ("برج إيفل 🗼", "برج إيفل"), ("تمثال الحرية 🗽", "تمثال الحرية"),
+        ("القدس الشريف 🕌", "القدس"), ("سور الصين العظيم 🧱", "سور الصين"), ("تاج محل 🏛️", "تاج محل"),
+        ("برج خليفة 🏢", "برج خليفة"), ("الكولوسيوم 🏛️", "الكولوسيوم"), ("ساعة بيغ بن 🕰️", "بيغ بن"),
+        ("برج بيزا المائل 🗼", "برج بيزا"), ("الكعبة المشرفة 🕋", "الكعبة"), ("المسجد النبوي 🕌", "المسجد النبوي"),
+        ("البتراء 🏛️", "البتراء"), ("تمثال المسيح الفادي 🗿", "المسيح الفادي"), ("ماتشو بيتشو 🏔️", "ماتشو بيتشو"),
+        ("أكروبوليس أثينا 🏛️", "الأكروبوليس"), ("قصر الحمراء 🏰", "قصر الحمراء"), ("جامع أيا صوفيا 🕌", "أيا صوفيا"),
+        ("متحف اللوفر 🎨", "متحف اللوفر"), ("دار أوبرا سيدني 🎭", "أوبرا سيدني"), ("قناة بنما 🚢", "قناة بنما"),
+        ("شلالات نياجرا 🌊", "شلالات نياجرا"), ("جبل إيفرست 🏔️", "جبل إيفرست"), ("الأخدود العظيم 🏜️", "الأخدود العظيم"),
+        ("برج العرب 🏨", "برج العرب"), ("جسر حديد سان فرانسيسكو 🌉", "جسر البوابة الذهبية"),
+        ("قصر فيرساي 🏰", "قصر فيرساي"), ("مبنى الإمباير ستيت 🏢", "إمباير ستيت"), ("ميدان تايمز سكوير 🗽", "تايمز سكوير"),
+        ("ساحة القديس بطرس 🏛️", "الفاتيكان"), ("كاتدرائية نوتردام ⛪", "نوتردام"), ("ستونهنج 🗿", "ستونهنج"),
+    ],
+    "وسائل نقل": [
+        ("سيارة رياضية 🏎️", "سيارة رياضية"), ("سيارة دافعة رباعية 🚙", "جيب"), ("حافلة ركاب 🚌", "باص"),
+        ("شاحنة نقل 🚛", "شاحنة"), ("دراجة نارية 🏍️", "موتورسيكل"), ("دراجة هوائية 🚲", "بسكليت"),
+        ("سكوتر كهربائي 🛴", "سكوتر"), ("طائرة ركاب ✈️", "طائرة ركاب"), ("طائرة عمودية 🚁", "هليكوبتر"),
+        ("طائرة حربية 🛩️", "طائرة حربية"), ("منطاد هوائي 🎈", "منطاد"), ("صاروخ فضاء 🚀", "صاروخ"),
+        ("سفينة شحن 🚢", "سفينة شحن"), ("قارب صيد 🚣", "قارب صيد"), ("جت سكي 🛥️", "جت سكي"),
+        ("منطاد حراري 🎈", "منطاد حراري"), ("قطار سريع 🚄", "قطار رصاصة"), ("قطار بخاري 🚂", "قطار بخاري"),
+        ("عربة خيل 🐎", "عربة خيل"), ("تلفريك 🚡", "تلفريك"), ("سيارة إسعاف 🚑", "إسعاف"),
+        ("سيارة إطفاء 🚒", "سيارة إطفاء"), ("سيارة شرطة 🚓", "سيارة شرطة"), ("تاكسي 🚕", "تاكسي"),
+        ("جرار زراعي 🚜", "جرار زراعي"), ("رافع أثقال 🏗️", "رافعة"), ("سيارة سباق فFormula 1 🏎️", "فورمولا 1"),
+    ],
+    "رياضة وترفيه": [
+        ("كرة القدم ⚽", "كرة القدم"), ("كرة السلة 🏀", "كرة السلة"), ("كرة الطائرة 🏐", "كرة الطائرة"),
+        ("كرة المضرب (تنس) 🎾", "تنس"), ("كرة الطاولة (بينج بونج) 🏓", "بينج بونج"), ("كرة الريشة 🏸", "كرة الريشة"),
+        ("البيسبول ⚾", "بيسبول"), ("الجولف ⛳", "جولف"), ("الملاكمة 🥊", "ملاكمة"),
+        ("الكاراتيه 🥋", "كاراتيه"), ("التايكوندو 🥋", "تايكوندو"), ("الجمباز 🤸", "جمباز"),
+        ("السباحة 🏊", "سباحة"), ("الغوص 📿", "غوص"), ("ركوب الأمواج 🏄", "ركوب الأمواج"),
+        ("التزلج على الجليد ⛸️", "تزلج على الجليد"), ("رماية السهام 🏹", "رماية السهام"), ("سباق الهجن 🐪", "سباق الهجن"),
+        ("سباق الخيل 🐎", "سباق الخيل"), ("الشطرنج ♟️", "شطرنج"), ("البلياردو 🎱", "بلياردو"),
+        ("البولينج 🎳", "بولينج"), ("العاب فيديو 🎮", "ألعاب فيديو"), ("تسلق الجبال 🧗", "تسلق الجبال"),
+        ("القفز المظلي 🪂", "قفز مظلي"), ("التجديف 🚣", "تجديف"), ("المصارعة 🤼", "مصارعة"),
+    ],
+}
+
+# Build the flat library, keeping the first entry for any repeated secret word.
+# The spy's final guess is matched by ``word``, and distractors are filtered by
+# ``word``, so two entries sharing a word would make both operations ambiguous.
+_seen_words: set[str] = set()
+_DUPLICATE_WORDS: list[str] = []
+for category, items in CATEGORIES.items():
+    for name, word in items:
+        if word in _seen_words:
+            _DUPLICATE_WORDS.append(word)
+            continue
+        _seen_words.add(word)
+        LOCATIONS.append({"name": name, "word": word, "category": category})
+
+# NOTE: an earlier revision padded this list up to exactly 500 entries by
+# cloning existing ones into synthetic variants ("مستشفى 🏥 #1" / "مستشفى_1").
+# Those variants were reachable as real secret words, so roughly a third of all
+# rounds were played on meaningless padding.  The library is now exactly the
+# curated set below -- fewer entries, all of them playable.
+assert LOCATIONS, "location library must not be empty"
+assert len({entry["word"] for entry in LOCATIONS}) == len(LOCATIONS), (
+    "duplicate secret words would make the spy's guess ambiguous"
+)
+
+
+def get_random_location() -> LocationEntry:
+    """Return a random secret location entry."""
+    return random.choice(LOCATIONS)
+
+
+def get_location_options(secret_entry: LocationEntry, count: int = 4) -> list[LocationEntry]:
+    """Generate distractor options prioritising the same category."""
+    secret_word = secret_entry["word"]
+    same_cat_items = [
+        loc for loc in LOCATIONS
+        if loc["category"] == secret_entry["category"] and loc["word"] != secret_word
+    ]
+    other_cat_items = [
+        loc for loc in LOCATIONS
+        if loc["category"] != secret_entry["category"] and loc["word"] != secret_word
+    ]
+
+    random.shuffle(same_cat_items)
+    random.shuffle(other_cat_items)
+
+    needed_distractors = count - 1
+    selected_distractors = same_cat_items[:needed_distractors]
+    if len(selected_distractors) < needed_distractors:
+        selected_distractors += other_cat_items[: needed_distractors - len(selected_distractors)]
+
+    all_options = [secret_entry] + selected_distractors
+    random.shuffle(all_options)
+    return all_options
+
+==============================================================================
+===== FILE: photo_guess_game/session_store.py =====
+==============================================================================
+
+"""In-memory thread-safe session store with automatic cleanup."""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from collections import OrderedDict
+from .models import GameSession, GameState
+
+_NON_TERMINAL_STATES = (
+    GameState.LOBBY,
+    GameState.DEALING,
+    GameState.GUESSING,
+    GameState.DISCUSSION,
+    GameState.VOTING,
+    GameState.SPY_LAST_GUESS,
+    GameState.REVEAL,
+)
+
+# Bounded number of recently-terminal sessions retained for late lookups
+# (e.g. a timer or callback firing just after a game ended).  Terminal sessions
+# never live in ``_sessions`` so active-resource counts stay tied to activity.
+_TOMBSTONE_LIMIT = 256
+
+
+class SessionStore:
+    """In-memory GameSession store with cross-group membership indexing and locks."""
+
+    def __init__(self) -> None:
+        self._sessions: dict[int, GameSession] = {}
+        self._tombstones: "OrderedDict[int, GameSession]" = OrderedDict()
+        self._user_memberships: dict[int, set[int]] = {}
+        self._locks: dict[int, asyncio.Lock] = {}
+        self._generations: dict[int, int] = {}
+
+    def next_generation(self, group_chat_id: int) -> int:
+        """Reserve the next generation number for a group chat.
+
+        Monotonic for the process lifetime and never reused, even after a
+        session is removed, so a timer or callback bound to an older generation
+        can never be mistaken for the current one.
+        """
+        generation = self._generations.get(group_chat_id, 0) + 1
+        self._generations[group_chat_id] = generation
+        return generation
+
+    def get(self, group_chat_id: int) -> GameSession | None:
+        """Return the active or recently-terminal session for group_chat_id."""
+        session = self._sessions.get(group_chat_id)
+        if session is not None:
+            return session
+        return self._tombstones.get(group_chat_id)
+
+    def put(self, session: GameSession) -> None:
+        """Store or update a session.
+
+        Non-terminal sessions live in ``_sessions`` and are indexed for
+        membership.  Terminal sessions are retired to the bounded tombstone map
+        and release their active resources (lock + membership) immediately.
+        """
+        session.last_activity_at = time.time()
+        session.touch()
+        gid = session.group_chat_id
+        if session.state in _NON_TERMINAL_STATES:
+            self._tombstones.pop(gid, None)
+            self._sessions[gid] = session
+            self._reindex_membership(session)
+        else:
+            self._retire(session)
+
+    def _retire(self, session: GameSession) -> None:
+        gid = session.group_chat_id
+        self._sessions.pop(gid, None)
+        self._locks.pop(gid, None)
+        self._discard_membership(session)
+        self._tombstones.pop(gid, None)
+        self._tombstones[gid] = session
+        while len(self._tombstones) > _TOMBSTONE_LIMIT:
+            self._tombstones.popitem(last=False)
+
+    def remove(self, group_chat_id: int) -> GameSession | None:
+        """Fully remove a session (active or tombstoned) and its lock."""
+        session = self._sessions.pop(group_chat_id, None)
+        if session is None:
+            session = self._tombstones.pop(group_chat_id, None)
+        else:
+            self._tombstones.pop(group_chat_id, None)
+        self._locks.pop(group_chat_id, None)
+        if session is not None:
+            self._discard_membership(session)
+        return session
+
+    def lock_for(self, group_chat_id: int) -> asyncio.Lock:
+        """Return the per-group asyncio.Lock."""
+        if group_chat_id not in self._locks:
+            self._locks[group_chat_id] = asyncio.Lock()
+        return self._locks[group_chat_id]
+
+    def group_chat_ids_for_user(self, user_id: int) -> frozenset[int]:
+        """Return the set of active group chat ids the user is a member of."""
+        return frozenset(self._user_memberships.get(user_id, set()))
+
+    def _discard_membership(self, session: GameSession) -> None:
+        gid = session.group_chat_id
+        for user_id in list(session.players):
+            groups = self._user_memberships.get(user_id)
+            if groups is not None:
+                groups.discard(gid)
+                if not groups:
+                    del self._user_memberships[user_id]
+
+    def _reindex_membership(self, session: GameSession) -> None:
+        gid = session.group_chat_id
+        for user_id, groups in list(self._user_memberships.items()):
+            groups.discard(gid)
+            if not groups:
+                del self._user_memberships[user_id]
+
+        if session.state in _NON_TERMINAL_STATES:
+            for user_id, player in session.players.items():
+                if player.active:
+                    self._user_memberships.setdefault(user_id, set()).add(gid)
+
+    def cleanup_expired(self, max_age_seconds: float = 3600.0) -> int:
+        """Purge stale tombstones older than max_age_seconds."""
+        now = time.time()
+        expired_gids = [
+            gid for gid, session in self._tombstones.items()
+            if (now - session.last_activity_at) > max_age_seconds
+        ]
+        for gid in expired_gids:
+            self._tombstones.pop(gid, None)
+            self._locks.pop(gid, None)
+        return len(expired_gids)
+
+==============================================================================
+===== FILE: photo_guess_game/session_manager.py =====
+==============================================================================
+
+"""Pure game logic engine for Telegram Spy Game."""
+
+from __future__ import annotations
+
+import html
+import random
+import time
+import uuid
+from typing import Callable
+
+from .locations import LocationEntry, get_location_options, get_random_location
+from .models import (
+    GameSession,
+    GameState,
+    Notification,
+    OperationResult,
+    Player,
+    RoundPhase,
+)
+from .session_store import SessionStore, _NON_TERMINAL_STATES
+
+MIN_PLAYERS_TO_START = 2
+MIN_PLAYERS_TO_VOTE = 3
+MAX_PLAYERS = 15
+DEFAULT_TIMEOUT_SECONDS = 300
+SPY_GUESS_OPTION_COUNT = 4
+
+LOBBY_BUTTONS = [
+    [
+        {"text": "➕ انضمام للعبة", "callback_data": "join_game"},
+        {"text": "🚪 مغادرة اللعبة", "callback_data": "leave_game"},
+    ],
+    [
+        {"text": "🚀 بدء اللعبة", "callback_data": "start_game"},
+        {"text": "❌ إلغاء اللعبة", "callback_data": "cancel_game"},
+    ],
+    [{"text": "📌 أظهر لوحة الأزرار بالأسفل", "callback_data": "refresh_panel"}],
+]
+
+ACTIVE_PANEL_BUTTONS = [
+    [{"text": "🗳️ بدء التصويت على الجاسوس", "callback_data": "start_voting"}],
+    [{"text": "💡 تخمين الكلمة السرية (الجاسوس)", "callback_data": "spy_guess_menu"}],
+    [{"text": "📌 أظهر لوحة الأزرار بالأسفل", "callback_data": "refresh_panel"}],
+]
+
+
+class SessionManager:
+    """Core state machine and rules engine for Spy Game."""
+
+    def __init__(
+        self,
+        store: SessionStore,
+        timer_service=None,
+        on_notification_cb: Callable[[list[Notification]], None] | None = None,
+        timeout_dispatcher: Callable[[str, int], None] | None = None,
+        round_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+    ) -> None:
+        self._store = store
+        self._timer_service = timer_service
+        self._on_notification_cb = on_notification_cb
+        self._timeout_dispatcher = timeout_dispatcher
+        self._round_seconds = round_seconds
+
+    @staticmethod
+    def generate_game_id() -> str:
+        """Generate a short 4-character hex game_id."""
+        return uuid.uuid4().hex[:4]
+
+    # ------------------------------------------------------------------
+    # Lobby lifecycle
+    # ------------------------------------------------------------------
+    def create_session(
+        self, group_chat_id: int, host_id: int, host_name: str, bot_username: str = "guessJobot"
+    ) -> OperationResult:
+        """Initialize a new GameSession in LOBBY state.
+
+        Rejects the request without mutation when a non-terminal session
+        already exists for the group, regardless of age, so an active lobby
+        or round is never silently replaced.
+        """
+        existing = self._store.get(group_chat_id)
+        if existing is not None and existing.state in _NON_TERMINAL_STATES:
+            return OperationResult(
+                ok=False,
+                reason="session_already_active",
+                alert_text="⚠️ هناك لعبة نشطة حالياً في هذه المجموعة!",
+                show_alert=True,
+                session=existing,
+            )
+
+        current_time = time.time()
+        clean_host_name = html.escape(host_name)
+        host = Player(user_id=host_id, display_name=clean_host_name, joined_at=current_time)
+        session = GameSession(
+            game_id=self.generate_game_id(),
+            group_chat_id=group_chat_id,
+            host_id=host_id,
+            state=GameState.LOBBY,
+            players={host_id: host},
+            created_at=current_time,
+            last_activity_at=current_time,
+            min_players=MIN_PLAYERS_TO_START,
+            max_players=MAX_PLAYERS,
+            generation=self._store.next_generation(group_chat_id),
+            guessing_timeout_seconds=self._round_seconds,
+        )
+        self._store.put(session)
+
+        announcement = Notification(
+            channel="group",
+            target_id=group_chat_id,
+            text=(
+                f"🕵️ <b>{clean_host_name}</b> بدأ لعبة <b>الجاسوس والكلمة السرية</b>!\n\n"
+                "<blockquote expandable>\n"
+                "<b>💡 فكرة اللعبة:</b>\n"
+                "البوت يرسل كلمة سرية واحدة بالخاص لجميع اللاعبين، ولكنه يختار شخصاً واحداً "
+                "ليكون <b>الجاسوس 🕵️</b> (لا يعرف الكلمة!).\n"
+                "اطرحوا أسئلة على بعضكم في المحادثة لاكتشاف الجاسوس دون إفشاء الكلمة السرية!\n"
+                "</blockquote>\n\n"
+                "<b>📋 طريقة اللعب:</b>\n"
+                "1️⃣ اضغط <b>➕ انضمام للعبة</b> أدناه.\n"
+                "2️⃣ اضغط <b>🚀 بدء اللعبة</b> للتصويت وتلقي الكلمات السرية بالخاص!\n\n"
+                f"👥 <b>اللوبي مفتوح الآن:</b> ({len(session.players)}/{session.max_players} لاعبين)"
+            ),
+            buttons=[list(row) for row in LOBBY_BUTTONS],
+        )
+        return OperationResult(ok=True, notifications=[announcement], session=session)
+
+    def join_session(
+        self, group_chat_id: int, user_id: int, display_name: str, bot_username: str = "guessJobot"
+    ) -> OperationResult:
+        """Add a player to a LOBBY state session."""
+        session = self._store.get(group_chat_id)
+        if session is None or session.state != GameState.LOBBY:
+            return OperationResult(
+                ok=False,
+                reason="not_joinable",
+                alert_text="⚠️ لا توجد لعبة مفتوحة في اللوبي حالياً.",
+                show_alert=True,
+                session=session,
+            )
+
+        if user_id in session.players:
+            return OperationResult(
+                ok=False,
+                reason="already_member",
+                alert_text="⚠️ أنت منضم لهذه اللعبة بالفعل! ✅",
+                show_alert=True,
+                session=session,
+            )
+
+        if len(session.players) >= session.max_players:
+            return OperationResult(
+                ok=False,
+                reason="lobby_full",
+                alert_text="⚠️ اللوبي ممتلئ بحده الأقصى من اللاعبين.",
+                show_alert=True,
+                session=session,
+            )
+
+        clean_name = html.escape(display_name)
+        session.players[user_id] = Player(
+            user_id=user_id, display_name=clean_name, joined_at=time.time()
+        )
+        self._store.put(session)
+
+        notif = Notification(
+            channel="group",
+            target_id=group_chat_id,
+            text=(
+                f"👤 <b>{clean_name}</b> انضم للعبة! "
+                f"({len(session.players)}/{session.max_players} لاعبين)"
+            ),
+            buttons=[list(row) for row in LOBBY_BUTTONS],
+            edit_message_id=session.control_message_id,
+        )
+        return OperationResult(ok=True, notifications=[notif], session=session)
+
+    def leave_session(
+        self, group_chat_id: int, user_id: int, bot_username: str = "guessJobot"
+    ) -> OperationResult:
+        """Remove a player from a LOBBY state session."""
+        session = self._store.get(group_chat_id)
+        if session is None or session.state != GameState.LOBBY:
+            return OperationResult(
+                ok=False,
+                reason="cannot_leave",
+                alert_text="⚠️ يمكنك المغادرة أثناء تواجد اللعبة في اللوبي فقط.",
+                show_alert=True,
+                session=session,
+            )
+
+        if user_id not in session.players:
+            return OperationResult(
+                ok=False,
+                reason="not_member",
+                alert_text="⚠️ أنت لست مشاركاً في هذه اللعبة.",
+                show_alert=True,
+                session=session,
+            )
+
+        departing = session.players.pop(user_id)
+
+        if not session.players:
+            session.state = GameState.CANCELLED
+            self._store.put(session)
+            notif = Notification(
+                channel="group",
+                target_id=group_chat_id,
+                text=f"🚪 {departing.display_name} غادر اللعبة ولم يبقَ أي لاعب — تم إلغاء اللعبة.",
+                buttons=[list(row) for row in LOBBY_BUTTONS],
+            )
+            return OperationResult(ok=True, notifications=[notif], session=session)
+
+        host_transferred = False
+        if departing.user_id == session.host_id:
+            oldest_player = min(session.players.values(), key=lambda p: p.joined_at)
+            session.host_id = oldest_player.user_id
+            host_transferred = True
+
+        self._store.put(session)
+
+        if host_transferred:
+            new_host = session.players[session.host_id]
+            text = (
+                f"🚪 {departing.display_name} غادر اللعبة.\n"
+                f"أصبح <b>{new_host.display_name}</b> منشئ اللعبة (Host) الآن."
+            )
+        else:
+            text = (
+                f"🚪 {departing.display_name} غادر اللعبة. "
+                f"({len(session.players)}/{session.max_players} لاعبين)"
+            )
+
+        notif = Notification(
+            channel="group",
+            target_id=group_chat_id,
+            text=text,
+            buttons=[list(row) for row in LOBBY_BUTTONS],
+            edit_message_id=session.control_message_id,
+        )
+        return OperationResult(ok=True, notifications=[notif], session=session)
+
+    def mark_dm_ready(self, user_id: int) -> None:
+        """Mark a user as having DM enabled across active sessions."""
+        for session in list(self._store._sessions.values()):
+            if user_id in session.players:
+                session.players[user_id].dm_ready = True
+
+    # ------------------------------------------------------------------
+    # Round start
+    # ------------------------------------------------------------------
+    def start_session(
+        self, group_chat_id: int, requester_id: int, bot_username: str = "guessJobot"
+    ) -> OperationResult:
+        """Validate requirements and transition a LOBBY session to GUESSING.
+
+        Assigns roles and the secret word once, produces the group readiness
+        announcement followed by one private role message per active player,
+        and schedules the one-shot round timers.
+        """
+        session = self._store.get(group_chat_id)
+        if session is None or session.state != GameState.LOBBY:
+            return OperationResult(
+                ok=False,
+                reason="not_in_lobby",
+                alert_text="⚠️ اللعبة ليست في مرحلة اللوبي لبدئها.",
+                show_alert=True,
+                session=session,
+            )
+
+        if requester_id != session.host_id:
+            return OperationResult(
+                ok=False,
+                reason="not_host",
+                alert_text="⚠️ عذراً، فقط منشئ اللعبة (Host) يمكنه بدء اللعبة.",
+                show_alert=True,
+                session=session,
+            )
+
+        active_players = [p for p in session.players.values() if p.active]
+        if len(active_players) < MIN_PLAYERS_TO_START:
+            return OperationResult(
+                ok=False,
+                reason="below_minimum",
+                alert_text=f"⚠️ يلزم وجود {MIN_PLAYERS_TO_START} لاعبين على الأقل لبدء اللعبة!",
+                show_alert=True,
+                session=session,
+            )
+
+        loc = get_random_location()
+        session.secret_location_name = loc["name"]
+        session.secret_location_word = loc["word"]
+        session.secret_category = loc.get("category", "")
+
+        active_uids = [p.user_id for p in active_players]
+        spy_uid = random.choice(active_uids)
+        session.spy_user_id = spy_uid
+        session.votes.clear()
+        session.eligible_vote_targets = active_uids.copy()
+        session.voting_active = False
+        session.spy_guessing_active = False
+        session.spy_guess_attempted = False
+        session.state = GameState.GUESSING
+
+        group_announcement = Notification(
+            channel="group",
+            target_id=group_chat_id,
+            text=(
+                "🕵️ <b>تم توزيع الكلمات السرية بالخاص لجميع اللاعبين!</b>\n\n"
+                "• هناك <b>جاسوس واحد</b> بينكم لا يعرف الكلمة السرية!\n"
+                "• ابدأوا النقاش والأسئلة فوراً في المحادثة.\n"
+                "• عند الجاهزية، اضغطوا <b>🗳️ بدء التصويت على الجاسوس</b> أدناه."
+            ),
+        )
+        notifications: list[Notification] = [group_announcement]
+
+        for player in session.players.values():
+            if not player.active:
+                continue
+            if player.user_id == spy_uid:
+                player.is_spy = True
+                player.secret_word = None
+                notifications.append(
+                    Notification(
+                        channel="dm",
+                        target_id=player.user_id,
+                        text=(
+                            "🚨 <b>أنت الجاسوس الوحيد في هذه الجولة! 🕵️‍♂️</b>\n\n"
+                            "❌ أنت لا تعرف الكلمة السرية للموقع!\n"
+                            "💡 تظاهر بأنك تعرف الكلمة واستمع لأسئلة المنافسين في المحادثة بذكاء حتى تكتشف المكان!"
+                        ),
+                    )
+                )
+            else:
+                player.is_spy = False
+                player.secret_word = loc["word"]
+                notifications.append(
+                    Notification(
+                        channel="dm",
+                        target_id=player.user_id,
+                        text=(
+                            "👥 <b>أنت مواطن شريف! (لست الجاسوس) ✅</b>\n\n"
+                            f"🤫 <b>الكلمة السرية للموقع هي: {loc['name']}</b>\n\n"
+                            "احذر أن يكتشفك الجاسوس! اسأل أسئلة ذكية في المحادثة لاكتشاف الجاسوس دون كشف الكلمة السرية."
+                        ),
+                    )
+                )
+
+        self._store.put(session)
+        self._schedule_round_timers(session)
+
+        return OperationResult(ok=True, notifications=notifications, session=session)
+
+    def _schedule_round_timers(self, session: GameSession) -> None:
+        """Arm the half-time reminder and the round deadline for this generation.
+
+        Uses the generation-bound ``schedule`` API rather than the legacy
+        ``start(group_chat_id, ...)`` helper.  The legacy helper hardcoded
+        generation ``0``, which no real session ever has, so any deployment that
+        wired ``session_lookup`` would have had every timer silently rejected.
+
+        ``expected_revision`` is deliberately left unset: the store bumps the
+        revision on every commit, so pinning it would let an ordinary vote
+        cancel the round deadline.
+        """
+        if self._timer_service is None:
+            return
+
+        key = session.session_key
+        timeout = session.guessing_timeout_seconds
+        if timeout <= 0:
+            self._fire_timeout("expired", session.group_chat_id)
+            return
+
+        self._timer_service.schedule(
+            key,
+            "half_elapsed",
+            f"{session.game_id}-r{session.round_number}-half",
+            timeout / 2,
+            lambda event: self._fire_timeout(
+                "half_elapsed", event.session_key.group_chat_id
+            ),
+            # Skipped automatically once a ballot or the spy's guess is open,
+            # where a "hurry up and vote" nudge would be noise.
+            expected_phase=RoundPhase.DISCUSSION,
+        )
+        self._timer_service.schedule(
+            key,
+            "expired",
+            f"{session.game_id}-r{session.round_number}-expired",
+            timeout,
+            lambda event: self._fire_timeout(
+                "expired", event.session_key.group_chat_id
+            ),
+        )
+
+    def _fire_timeout(self, kind: str, group_chat_id: int) -> None:
+        """Hand a fired timer to the injected dispatcher, or resolve inline.
+
+        Timer callbacks run synchronously in the event loop, so mutating a
+        session directly from one can interleave with a handler that is holding
+        the group lock across an ``await``.  When a dispatcher is injected the
+        work is re-entered asynchronously under that lock instead.  The inline
+        branch keeps the component usable in synchronous tests.
+        """
+        if self._timeout_dispatcher is not None:
+            self._timeout_dispatcher(kind, group_chat_id)
+            return
+        if kind == "half_elapsed":
+            self._on_half_elapsed(group_chat_id)
+        else:
+            self._on_expired(group_chat_id)
+
+    def rollback_failed_start(
+        self, group_chat_id: int, failed_user_ids: list[int], bot_username: str = "guessJobot"
+    ) -> OperationResult:
+        """Roll a GUESSING round back to LOBBY when role delivery fails.
+
+        Keeps the round unplayable: clears roles/secret, cancels timers, and
+        returns a group notification naming the failed recipients without any
+        success announcement.
+        """
+        session = self._store.get(group_chat_id)
+        if session is None or session.state != GameState.GUESSING:
+            return OperationResult(ok=False, reason="not_in_guessing", session=session)
+
+        if self._timer_service is not None:
+            self._timer_service.cancel(group_chat_id)
+
+        for uid in failed_user_ids:
+            if uid in session.players:
+                session.players[uid].dm_ready = False
+
+        for player in session.players.values():
+            player.is_spy = False
+            player.secret_word = None
+
+        session.state = GameState.LOBBY
+        session.spy_user_id = None
+        session.secret_location_name = ""
+        session.secret_location_word = ""
+        session.secret_category = ""
+        session.votes.clear()
+        session.voting_active = False
+        session.spy_guessing_active = False
+
+        failed_names = ", ".join(
+            session.players[uid].display_name
+            for uid in failed_user_ids
+            if uid in session.players
+        )
+        notif = Notification(
+            channel="group",
+            target_id=group_chat_id,
+            text=(
+                "❌ <b>فشل إرسال الكلمات السرية بالخاص!</b>\n\n"
+                "تعذر الإرسال للاعبين التالية أسماؤهم بسبب حظر البوت أو عدم تفعيل الخاص:\n"
+                f"👉 <b>{failed_names}</b>\n\n"
+                "تمت إعادة اللعبة للوبي. يرجى تفعيل الخاص مع البوت ومحاولة البدء مجدداً."
+            ),
+            buttons=[list(row) for row in LOBBY_BUTTONS],
+            edit_message_id=session.control_message_id,
+        )
+        self._store.put(session)
+        return OperationResult(ok=False, reason="role_delivery_failed", notifications=[notif], session=session)
+
+    # ------------------------------------------------------------------
+    # Voting
+    # ------------------------------------------------------------------
+    def start_voting_panel(self, group_chat_id: int) -> OperationResult:
+        """Open the spy ballot for an active GUESSING round."""
+        session = self._store.get(group_chat_id)
+        if session is None or session.state != GameState.GUESSING:
+            return OperationResult(
+                ok=False,
+                reason="not_playing",
+                alert_text="⚠️ لا يمكنك فتح التصويت في الوقت الحالي.",
+                show_alert=True,
+                session=session,
+            )
+
+        if session.voting_active:
+            return OperationResult(
+                ok=False,
+                reason="voting_already_open",
+                alert_text="⚠️ التصويت مفتوح بالفعل.",
+                show_alert=True,
+                session=session,
+            )
+
+        active_players = [p for p in session.players.values() if p.active]
+        if len(active_players) < MIN_PLAYERS_TO_VOTE:
+            return OperationResult(
+                ok=False,
+                reason="not_enough_players",
+                alert_text=f"⚠️ يلزم {MIN_PLAYERS_TO_VOTE} لاعبين على الأقل لفتح التصويت.",
+                show_alert=True,
+                session=session,
+            )
+
+        session.voting_active = True
+        session.vote_round = 1
+        session.votes.clear()
+        session.eligible_vote_targets = [p.user_id for p in active_players]
+
+        notif = Notification(
+            channel="group",
+            target_id=group_chat_id,
+            text=(
+                "🗳️ <b>بدأ التصويت على الجاسوس!</b>\n\n"
+                "اضغط على اسم اللاعب الذي تشك أنه الجاسوس أدناه:"
+            ),
+            buttons=self._build_vote_buttons(active_players),
+            edit_message_id=session.control_message_id,
+        )
+        self._store.put(session)
+        return OperationResult(ok=True, notifications=[notif], session=session)
+
+    def record_spy_vote(
+        self, group_chat_id: int, voter_id: int, target_id: int
+    ) -> OperationResult:
+        """Record a single vote, resolving the round when every active voter has voted."""
+        session = self._store.get(group_chat_id)
+        if session is None or session.state != GameState.GUESSING or not session.voting_active:
+            return OperationResult(
+                ok=False,
+                reason="voting_not_open",
+                alert_text="⚠️ التصويت غير مفتوح حالياً.",
+                show_alert=True,
+                session=session,
+            )
+
+        if voter_id not in session.players or not session.players[voter_id].active:
+            return OperationResult(
+                ok=False,
+                reason="not_active_voter",
+                alert_text="⚠️ أنت لست مشاركاً نشطاً في هذه الجولة.",
+                show_alert=True,
+                session=session,
+            )
+
+        if target_id not in session.eligible_vote_targets or target_id not in session.players:
+            return OperationResult(
+                ok=False,
+                reason="ineligible_target",
+                alert_text="⚠️ هذا الهدف غير متاح في جولة التصويت الحالية.",
+                show_alert=True,
+                session=session,
+            )
+
+        if voter_id in session.votes:
+            return OperationResult(
+                ok=False,
+                reason="already_voted",
+                alert_text="⚠️ لقد قمت بالتصويت مسبقاً في هذه الجولة! ✅",
+                show_alert=True,
+                session=session,
+            )
+
+        session.votes[voter_id] = target_id
+        active_players = [p for p in session.players.values() if p.active]
+        total_active = len(active_players)
+        voted_count = len(session.votes)
+        voter_name = session.players[voter_id].display_name
+
+        vote_recorded = Notification(
+            channel="group",
+            target_id=group_chat_id,
+            text=f"🗳️ قام <b>{voter_name}</b> بالتصويت! ({voted_count}/{total_active} أصوات)",
+            edit_message_id=session.control_message_id,
+        )
+
+        if voted_count < total_active:
+            self._store.put(session)
+            return OperationResult(
+                ok=True,
+                alert_text="✅ تم تسجيل صوتك بنجاح!",
+                show_alert=True,
+                notifications=[vote_recorded],
+                session=session,
+            )
+
+        # Everyone active has voted -> tally.
+        tally: dict[int, int] = {}
+        for tid in session.votes.values():
+            tally[tid] = tally.get(tid, 0) + 1
+        max_votes = max(tally.values())
+        top_targets = [tid for tid, count in tally.items() if count == max_votes]
+
+        if len(top_targets) > 1:
+            # Tie: close the ballot without eliminating anyone.
+            session.voting_active = False
+            session.votes.clear()
+            session.eligible_vote_targets = [p.user_id for p in active_players]
+            self._store.put(session)
+            tie_notif = Notification(
+                channel="group",
+                target_id=group_chat_id,
+                text=(
+                    "⚖️ <b>تعادل في التصويت!</b>\n\n"
+                    "لم يتم إقصاء أي لاعب. تابعوا النقاش وأعيدوا فتح التصويت عند الجاهزية."
+                ),
+                edit_message_id=session.control_message_id,
+            )
+            return OperationResult(
+                ok=True,
+                alert_text="⚖️ تعادل! لم يُقصَ أحد.",
+                show_alert=True,
+                notifications=[vote_recorded, tie_notif],
+                session=session,
+            )
+
+        accused_id = top_targets[0]
+        accused_name = session.players[accused_id].display_name
+        session.voting_active = False
+
+        if accused_id == session.spy_user_id:
+            # Spy exposed: grant the single final guess opportunity.
+            session.spy_guessing_active = True
+            session.spy_guess_attempted = False
+            self._store.put(session)
+            caught_notif = Notification(
+                channel="group",
+                target_id=group_chat_id,
+                text=(
+                    f"🎯 <b>تم كشف الجاسوس: {accused_name}! 🕵️‍♂️</b>\n\n"
+                    "💡 لديه فرصة أخيرة لتخمين الكلمة السرية للفوز."
+                ),
+                buttons=[[{"text": "💡 تخمين الكلمة السرية (الجاسوس)", "callback_data": "spy_guess_menu"}]],
+                edit_message_id=session.control_message_id,
+            )
+            return OperationResult(
+                ok=True,
+                alert_text="🎯 تم كشف الجاسوس!",
+                show_alert=True,
+                notifications=[vote_recorded, caught_notif],
+                session=session,
+            )
+
+        # Innocent accused -> spy wins.
+        spy_player = session.players.get(session.spy_user_id)
+        spy_name = spy_player.display_name if spy_player else "الجاسوس"
+        secret_name = session.secret_location_name
+        session.state = GameState.COMPLETED
+        if self._timer_service is not None:
+            self._timer_service.cancel(group_chat_id)
+        self._store.put(session)
+        win_notif = Notification(
+            channel="group",
+            target_id=group_chat_id,
+            text=(
+                "🎉 <b>فاز الجاسوس! 🕵️🏆</b>\n\n"
+                f"قام الجميع بطرد خاطئ لـ <b>{accused_name}</b>!\n"
+                f"بينما الجاسوس الحقيقي <b>{spy_name}</b> نجح بالتمويه والمكر وخدع الجميع!\n"
+                f"📍 المكان السري كان: <b>{secret_name}</b>"
+            ),
+            edit_message_id=session.control_message_id,
+        )
+        return OperationResult(
+            ok=True,
+            alert_text="🎉 فاز الجاسوس!",
+            show_alert=True,
+            notifications=[vote_recorded, win_notif],
+            session=session,
+        )
+
+    # ------------------------------------------------------------------
+    # Spy final guess
+    # ------------------------------------------------------------------
+    def submit_spy_location_guess(
+        self, group_chat_id: int, actor_id: int, word: str
+    ) -> OperationResult:
+        """Submit the spy's single allowed location guess by word."""
+        session = self._store.get(group_chat_id)
+        if session is None or not session.spy_guessing_active:
+            return OperationResult(
+                ok=False,
+                reason="not_in_spy_guess",
+                alert_text="⚠️ التخمين غير متاح حالياً.",
+                show_alert=True,
+                session=session,
+            )
+
+        if actor_id != session.spy_user_id:
+            return OperationResult(
+                ok=False,
+                reason="not_spy",
+                alert_text="⚠️ عذراً، التخمين مخصص للجاسوس فقط!",
+                show_alert=True,
+                session=session,
+            )
+
+        if session.spy_guess_attempted:
+            return OperationResult(
+                ok=False,
+                reason="already_attempted",
+                alert_text="⚠️ تمت محاولة التخمين مسبقاً!",
+                show_alert=True,
+                session=session,
+            )
+
+        session.spy_guess_attempted = True
+        session.spy_guessing_active = False
+        session.state = GameState.COMPLETED
+        if self._timer_service is not None:
+            self._timer_service.cancel(group_chat_id)
+
+        spy_player = session.players.get(session.spy_user_id)
+        spy_name = spy_player.display_name if spy_player else "الجاسوس"
+        secret_word = session.secret_location_word or ""
+        secret_name = session.secret_location_name
+        correct = bool(word) and word.strip().lower() == secret_word.strip().lower()
+
+        if correct:
+            text = (
+                "🎉 <b>تخمين عبقري من الجاسوس! 🕵️‍♂️🏆</b>\n\n"
+                f"عرف الجاسوس <b>{spy_name}</b> المكان السري الصحيح وهو: <b>{secret_name}</b> وفاز بالجولة!"
+            )
+        else:
+            text = (
+                "❌ <b>تخمين خاطئ من الجاسوس! 🕵️‍♂️</b>\n\n"
+                f"حاول الجاسوس {spy_name} التخمين لكن الإجابة كانت خاطئة!\n"
+                f"🤫 المكان السري الحقيقي كان: <b>{secret_name}</b>\n\n"
+                "🏆 <b>فاز المواطنون الشرفاء بالجولة! 👥🎉</b>"
+            )
+
+        self._store.put(session)
+        notif = Notification(
+            channel="group",
+            target_id=group_chat_id,
+            text=text,
+            edit_message_id=session.control_message_id,
+        )
+        return OperationResult(ok=True, notifications=[notif], session=session)
+
+    # ------------------------------------------------------------------
+    # Cancellation
+    # ------------------------------------------------------------------
+    def cancel_session(self, group_chat_id: int, user_id: int) -> OperationResult:
+        """Cancel an active session (Host-only) and scrub its resources."""
+        session = self._store.get(group_chat_id)
+        if session is None or session.state not in _NON_TERMINAL_STATES:
+            return OperationResult(
+                ok=False,
+                reason="no_active_session",
+                alert_text="⚠️ لا توجد لعبة نشطة لإلغائها.",
+                show_alert=True,
+                session=session,
+            )
+
+        if user_id != session.host_id:
+            return OperationResult(
+                ok=False,
+                reason="not_host",
+                alert_text="⚠️ عذراً، فقط منشئ اللعبة (Host) يمكنه إلغاء اللعبة.",
+                show_alert=True,
+                session=session,
+            )
+
+        if self._timer_service is not None:
+            self._timer_service.cancel(group_chat_id)
+
+        host_name = session.players[session.host_id].display_name
+        self._scrub_terminal(session, GameState.CANCELLED)
+        self._store.put(session)
+
+        notif = Notification(
+            channel="group",
+            target_id=group_chat_id,
+            text=f"❌ قام <b>{host_name}</b> بإلغاء اللعبة.",
+        )
+        return OperationResult(ok=True, notifications=[notif], session=session)
+
+    # ------------------------------------------------------------------
+    # Timeout / reveal
+    # ------------------------------------------------------------------
+    def half_time_reminder(self, group_chat_id: int) -> OperationResult:
+        """Build the half-time nudge without mutating the session."""
+        session = self._store.get(group_chat_id)
+        if session is None or session.state != GameState.GUESSING:
+            return OperationResult(ok=False, reason="not_in_guessing", session=session)
+        notif = Notification(
+            channel="group",
+            target_id=group_chat_id,
+            text="⏳ <b>تذكير: نصف الوقت مضى!</b> سارعوا بالنقاش والتصويت.",
+        )
+        return OperationResult(ok=True, notifications=[notif], session=session)
+
+    def _on_half_elapsed(self, group_chat_id: int) -> OperationResult:
+        res = self.half_time_reminder(group_chat_id)
+        if res.ok and self._on_notification_cb is not None:
+            self._on_notification_cb(res.notifications)
+        return res
+
+    def _on_expired(self, group_chat_id: int) -> OperationResult:
+        res = self.enter_reveal(group_chat_id)
+        if res.ok and self._on_notification_cb is not None:
+            self._on_notification_cb(res.notifications)
+        return res
+
+    def enter_reveal(self, group_chat_id: int) -> OperationResult:
+        """Resolve a GUESSING round whose discussion timer expired.
+
+        Nobody exposed the spy before the deadline, so the spy takes the round.
+        The spy's identity and the secret location are disclosed before the
+        session is scrubbed, because scrubbing clears both.
+        """
+        session = self._store.get(group_chat_id)
+        if session is None or session.state != GameState.GUESSING:
+            return OperationResult(ok=False, reason="not_in_guessing", session=session)
+
+        session.state = GameState.REVEAL
+
+        spy_player = (
+            session.players.get(session.spy_user_id)
+            if session.spy_user_id is not None
+            else None
+        )
+        spy_name = spy_player.display_name if spy_player is not None else "الجاسوس"
+        secret_name = session.secret_location_name or "غير معروف"
+
+        if self._timer_service is not None:
+            self._timer_service.cancel(group_chat_id)
+
+        notif = Notification(
+            channel="group",
+            target_id=group_chat_id,
+            text=(
+                "⏰ <b>انتهى الوقت ولم يُكشف الجاسوس!</b>\n\n"
+                f"🕵️ الجاسوس كان: <b>{spy_name}</b>\n"
+                f"📍 المكان السري كان: <b>{secret_name}</b>\n\n"
+                "🏆 <b>فاز الجاسوس بالجولة! 🕵️🎉</b>"
+            ),
+            edit_message_id=session.control_message_id,
+        )
+
+        self._scrub_terminal(session, GameState.COMPLETED)
+        self._store.put(session)
+        return OperationResult(ok=True, notifications=[notif], session=session)
+
+    # ------------------------------------------------------------------
+    # Spy final-guess menu
+    # ------------------------------------------------------------------
+    def build_spy_guess_menu(self, group_chat_id: int, actor_id: int) -> OperationResult:
+        """Offer the exposed spy a fixed multiple-choice ballot of locations.
+
+        The option list is generated once per round and then reused, so the spy
+        cannot reroll for an easier set of distractors by reopening the menu.
+        """
+        session = self._store.get(group_chat_id)
+        if session is None or not session.spy_guessing_active:
+            return OperationResult(
+                ok=False,
+                reason="not_in_spy_guess",
+                alert_text="⚠️ التخمين غير متاح حالياً.",
+                show_alert=True,
+                session=session,
+            )
+
+        if actor_id != session.spy_user_id:
+            return OperationResult(
+                ok=False,
+                reason="not_spy",
+                alert_text="⚠️ عذراً، التخمين مخصص للجاسوس فقط!",
+                show_alert=True,
+                session=session,
+            )
+
+        if session.spy_guess_attempted:
+            return OperationResult(
+                ok=False,
+                reason="already_attempted",
+                alert_text="⚠️ تمت محاولة التخمين مسبقاً!",
+                show_alert=True,
+                session=session,
+            )
+
+        if not session.spy_guess_options:
+            secret_entry: LocationEntry = {
+                "name": session.secret_location_name or "",
+                "word": session.secret_location_word or "",
+                "category": session.secret_category,
+            }
+            options = get_location_options(secret_entry, SPY_GUESS_OPTION_COUNT)
+            session.spy_guess_options = [option["word"] for option in options]
+            session.spy_guess_labels = [option["name"] for option in options]
+            self._store.put(session)
+
+        buttons: list[list[dict[str, str]]] = []
+        row: list[dict[str, str]] = []
+        for index, label in enumerate(session.spy_guess_labels):
+            row.append({"text": label, "callback_data": f"spy_guess:{index}"})
+            if len(row) == 2:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+
+        notif = Notification(
+            channel="group",
+            target_id=group_chat_id,
+            text=(
+                "💡 <b>فرصة الجاسوس الأخيرة!</b>\n\n"
+                "على الجاسوس اختيار المكان السري الصحيح من الخيارات أدناه.\n"
+                "<b>محاولة واحدة فقط — لا تراجع.</b>"
+            ),
+            buttons=buttons,
+        )
+        return OperationResult(ok=True, notifications=[notif], session=session)
+
+    def resolve_spy_guess_option(self, group_chat_id: int, option_index: int) -> str | None:
+        """Map a menu button index back to its secret word, or ``None``."""
+        session = self._store.get(group_chat_id)
+        if session is None:
+            return None
+        if not 0 <= option_index < len(session.spy_guess_options):
+            return None
+        return session.spy_guess_options[option_index]
+
+    # ------------------------------------------------------------------
+    # Panel / helpers
+    # ------------------------------------------------------------------
+    def build_status_panel_notification(self, group_chat_id: int, header: str) -> Notification:
+        """Build the current control panel notification for a group."""
+        session = self._store.get(group_chat_id)
+        body = (
+            "🕵️ <b>لوحة التحكم للجولة النشطة:</b>\n"
+            "الأسئلة مستمرة في المجموعة! عند الجاهزية اضغط زر التصويت أدناه."
+        )
+        return Notification(
+            channel="group",
+            target_id=group_chat_id,
+            text=f"{header}\n\n{body}",
+            buttons=[list(row) for row in ACTIVE_PANEL_BUTTONS],
+            edit_message_id=session.control_message_id if session else None,
+        )
+
+    def _build_vote_buttons(self, active_players: list[Player]) -> list[list[dict[str, str]]]:
+        buttons: list[list[dict[str, str]]] = []
+        row: list[dict[str, str]] = []
+        for player in active_players:
+            row.append({"text": f"👤 {player.display_name}", "callback_data": f"vote:{player.user_id}"})
+            if len(row) == 2:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+        return buttons
+
+    def _scrub_terminal(self, session: GameSession, terminal_state: GameState) -> None:
+        """Mark a session terminal and erase every round secret it still holds."""
+        session.state = terminal_state
+        session.voting_active = False
+        session.spy_guessing_active = False
+        session.votes.clear()
+        session.eligible_vote_targets = []
+        session.spy_guess_options = []
+        session.spy_guess_labels = []
+        session.secret_location_word = None
+        session.secret_location_name = None
+        session.secret_category = ""
+        for player in session.players.values():
+            player.is_spy = False
+            player.secret_word = None
+
+==============================================================================
+===== FILE: photo_guess_game/timer_service.py =====
+==============================================================================
+
+"""Generation-bound, tracked timer delivery.
+
+Timers own no game mutation.  A firing removes its handle first, validates the
+session guard, and emits an immutable :class:`TimerEvent` to the shared event
+executor.  The injected scheduler keeps tests deterministic and free of real
+sleep.
+
+Requirements: 2.3, 2.4, 2.12, 2.16, 3.10
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import Any, Callable, Protocol
+
+from .models import GameSession, RoundPhase, SessionKey
+
+
+class CancelHandle(Protocol):
+    """Minimal handle returned by ``asyncio.call_later``-style schedulers."""
+
+    def cancel(self) -> Any: ...
+
+
+Scheduler = Callable[[float, Callable[[], None]], CancelHandle]
+EventExecutor = Callable[["TimerEvent"], object]
+EventValidator = Callable[["TimerEvent"], bool]
+SessionLookup = Callable[[SessionKey], GameSession | None]
+
+
+@dataclass(frozen=True, slots=True)
+class TimerEvent:
+    """Immutable timeout input carrying every state-commit guard."""
+
+    session_key: SessionKey
+    timer_kind: str
+    timer_id: str
+    expected_phase: RoundPhase | None = None
+    expected_revision: int | None = None
+
+    def __post_init__(self) -> None:
+        if not self.timer_kind:
+            raise ValueError("timer_kind must not be empty")
+        if not self.timer_id:
+            raise ValueError("timer_id must not be empty")
+        if self.expected_revision is not None and self.expected_revision < 0:
+            raise ValueError("expected_revision must be non-negative")
+
+    def matches(
+        self,
+        session: GameSession | None,
+        *,
+        current_timer_id: str | None = None,
+    ) -> bool:
+        """Return whether this event may enter a state transaction.
+
+        Executors must call this again against the session read inside their
+        transaction.  ``TimerService`` performs the same check before
+        registration and immediately before dispatch.
+        """
+        if session is None or session.terminal:
+            return False
+        if session.session_key != self.session_key:
+            return False
+        if self.expected_phase is not None and session.phase != self.expected_phase:
+            return False
+        if (
+            self.expected_revision is not None
+            and session.revision != self.expected_revision
+        ):
+            return False
+        return current_timer_id is None or current_timer_id == self.timer_id
+
+
+@dataclass(slots=True)
+class _TimerRecord:
+    event: TimerEvent
+    executor: EventExecutor
+    handle: CancelHandle | None = None
+
+
+class TimerService:
+    """Track exactly one current timer per ``(SessionKey, timer_kind)``.
+
+    ``session_lookup`` is the guard bridge used by modern callers.  Looking up
+    by the full :class:`SessionKey` rejects old generations, while
+    ``TimerEvent.matches`` checks terminal state, phase, and revision.  A
+    custom validator can add executor-specific guards.  Both checks are
+    fail-closed.
+
+    The legacy ``start(group_id, ...)`` and ``cancel(group_id)`` methods remain
+    temporarily available while older SessionManager paths migrate.
+    """
+
+    def __init__(
+        self,
+        scheduler: Scheduler,
+        event_executor: EventExecutor | None = None,
+        *,
+        session_lookup: SessionLookup | None = None,
+        validator: EventValidator | None = None,
+    ) -> None:
+        self._scheduler = scheduler
+        self._event_executor = event_executor
+        self._session_lookup = session_lookup
+        self._validator = validator
+        self._pending: dict[tuple[SessionKey, str, str], _TimerRecord] = {}
+        self._current: dict[tuple[SessionKey, str], str] = {}
+        self._legacy_sequence = 0
+        self._accepting = True
+
+    @property
+    def accepting(self) -> bool:
+        """Whether new timer handles may still be registered."""
+        return self._accepting
+
+    @property
+    def pending_count(self) -> int:
+        """Number of live, registered handles."""
+        return len(self._pending)
+
+    def pending_for(self, key: SessionKey, timer_kind: str | None = None) -> int:
+        """Count timers owned by one exact session generation."""
+        return sum(
+            1
+            for pending_key in self._pending
+            if pending_key[0] == key
+            and (timer_kind is None or pending_key[1] == timer_kind)
+        )
+
+    @property
+    def pending_keys(self) -> frozenset[tuple[SessionKey, str, str]]:
+        """Detached registry view intended for diagnostics and tests."""
+        return frozenset(self._pending)
+
+    def schedule(
+        self,
+        key: SessionKey,
+        timer_kind: str,
+        timer_id: str,
+        delay: float,
+        emit: EventExecutor | None = None,
+        *,
+        expected_phase: RoundPhase | None = None,
+        expected_revision: int | None = None,
+    ) -> bool:
+        """Register a guarded timer, replacing the current timer of its kind.
+
+        Returns ``False`` without touching existing timers when the session is
+        already stale/terminal or a phase/revision guard does not match.  This
+        ordering closes the race where a late schedule effect arrives after a
+        terminal cancellation.
+        """
+        if not isinstance(key, SessionKey):
+            raise TypeError("key must be a SessionKey")
+        if not self._accepting:
+            return False
+        if not isinstance(delay, (int, float)) or not math.isfinite(delay):
+            raise ValueError("delay must be a finite number")
+        if delay < 0:
+            raise ValueError("delay must be non-negative")
+        executor = emit or self._event_executor
+        if executor is None:
+            raise TypeError("an event executor is required")
+
+        event = TimerEvent(
+            session_key=key,
+            timer_kind=timer_kind,
+            timer_id=timer_id,
+            expected_phase=expected_phase,
+            expected_revision=expected_revision,
+        )
+        if not self._event_is_current(event):
+            return False
+
+        # A new timer of the same kind supersedes only that exact generation's
+        # previous timer. Other kinds and other generations remain independent.
+        self.cancel(key, timer_kind)
+        index = (key, timer_kind, timer_id)
+        kind_index = (key, timer_kind)
+        record = _TimerRecord(event=event, executor=executor)
+        self._pending[index] = record
+        self._current[kind_index] = timer_id
+
+        def fire() -> None:
+            current = self._pending.get(index)
+            if current is not record:
+                return
+            if self._current.get(kind_index) != timer_id:
+                return
+
+            # Removal must precede validation and dispatch so re-entrancy,
+            # executor failure, or duplicate scheduler callbacks cannot fire it
+            # twice or retain a dead handle.
+            self._pending.pop(index, None)
+            self._current.pop(kind_index, None)
+            if not self._event_is_current(event):
+                return
+            result = executor(event)
+            # TimerService deliberately does not create orphan async tasks.
+            if hasattr(result, "__await__"):
+                close = getattr(result, "close", None)
+                if callable(close):
+                    close()
+                raise TypeError("timer event executor must be synchronous")
+
+        try:
+            handle = self._scheduler(float(delay), fire)
+        except BaseException:
+            if self._pending.get(index) is record:
+                self._pending.pop(index, None)
+            if self._current.get(kind_index) == timer_id:
+                self._current.pop(kind_index, None)
+            raise
+
+        record.handle = handle
+        # Defend against an unusual scheduler that invokes zero-delay callbacks
+        # synchronously before returning its handle.
+        if self._pending.get(index) is not record:
+            handle.cancel()
+        return True
+
+    def _event_is_current(self, event: TimerEvent) -> bool:
+        try:
+            if self._session_lookup is not None:
+                if not event.matches(self._session_lookup(event.session_key)):
+                    return False
+            if self._validator is not None and not self._validator(event):
+                return False
+        except Exception:
+            return False
+        return True
+
+    def cancel(
+        self,
+        target: SessionKey | int,
+        timer_kind: str | None = None,
+        timer_id: str | None = None,
+    ) -> int:
+        """Idempotently cancel matching timers and return the removed count.
+
+        Passing an ``int`` preserves the old group-wide API.  Modern callers
+        should pass an exact ``SessionKey`` (or use :meth:`cancel_session`).
+        """
+        if timer_id is not None and timer_kind is None:
+            raise ValueError("timer_id requires timer_kind")
+
+        matches: list[tuple[SessionKey, str, str]] = []
+        for index in tuple(self._pending):
+            key, kind, identifier = index
+            owner_matches = (
+                key == target
+                if isinstance(target, SessionKey)
+                else key.group_chat_id == target
+            )
+            if not owner_matches:
+                continue
+            if timer_kind is not None and kind != timer_kind:
+                continue
+            if timer_id is not None and identifier != timer_id:
+                continue
+            matches.append(index)
+
+        for index in matches:
+            record = self._pending.pop(index, None)
+            if record is None:
+                continue
+            key, kind, identifier = index
+            if self._current.get((key, kind)) == identifier:
+                self._current.pop((key, kind), None)
+            if record.handle is not None:
+                record.handle.cancel()
+        return len(matches)
+
+    def cancel_session(self, key: SessionKey) -> int:
+        """Cancel every timer for one exact generation; safe when repeated."""
+        return self.cancel(key)
+
+    def cancel_all(self) -> int:
+        """Cancel every currently registered timer."""
+        count = 0
+        for key in {index[0] for index in tuple(self._pending)}:
+            count += self.cancel_session(key)
+        return count
+
+    def shutdown(self) -> int:
+        """Stop timer admission and synchronously release all handles.
+
+        Removing records before cancelling their handles makes even a raced
+        scheduler callback harmless.  No state lock or asynchronous wait is
+        involved, so this is safe as the first cancellation step of shutdown.
+        """
+        self._accepting = False
+        return self.cancel_all()
+
+    # ------------------------------------------------------------------
+    # Temporary compatibility surface for the original group-only timer.
+    # ------------------------------------------------------------------
+    def start(
+        self,
+        group_chat_id: int,
+        duration_seconds: int,
+        on_half_elapsed: Callable[[int], None],
+        on_expired: Callable[[int], None],
+    ) -> None:
+        """Start the legacy half/expiry pair without real sleeps.
+
+        Existing group-only timers use generation zero solely as a compatibility
+        namespace. New code must use :meth:`schedule` with the real SessionKey.
+        """
+        if duration_seconds < 0:
+            raise ValueError("duration_seconds must be non-negative")
+        self.cancel(group_chat_id)
+        if duration_seconds == 0:
+            on_expired(group_chat_id)
+            return
+
+        self._legacy_sequence += 1
+        sequence = self._legacy_sequence
+        key = SessionKey(group_chat_id, 0)
+        self.schedule(
+            key,
+            "half_elapsed",
+            f"legacy-{sequence}-half",
+            duration_seconds / 2,
+            lambda event: on_half_elapsed(event.session_key.group_chat_id),
+        )
+        self.schedule(
+            key,
+            "expired",
+            f"legacy-{sequence}-expired",
+            duration_seconds,
+            lambda event: on_expired(event.session_key.group_chat_id),
+        )
+
+==============================================================================
+===== FILE: photo_guess_game/telegram_adapter.py =====
+==============================================================================
+
+"""Telegram I/O boundary layer separating decision locking from async HTTP effects."""
+
+from __future__ import annotations
+
+from typing import Any, Callable, Coroutine
+from .models import Notification, OperationResult
+from .session_manager import SessionManager
+from .session_store import SessionStore
+
+
+class TelegramAdapter:
+    """I/O boundary adapter connecting Telegram events to the game rules engine.
+
+    Decisions run synchronously under the per-group lock; every Telegram send
+    happens afterwards, outside the lock, so no network await ever occurs while
+    a group's state lock is held.
+    """
+
+    def __init__(
+        self,
+        store: SessionStore,
+        session_manager: SessionManager | None = None,
+        timer_service=None,
+        send_message_fn: Callable[..., Coroutine[Any, Any, object]] | None = None,
+        edit_message_fn: Callable[..., Coroutine[Any, Any, object]] | None = None,
+        edit_markup_fn: Callable[..., Coroutine[Any, Any, object]] | None = None,
+        bot_username: str = "guessJobot",
+    ) -> None:
+        self._store = store
+        self.timer_service = timer_service
+        self.session_manager = session_manager or SessionManager(store, timer_service=timer_service)
+        self._send_message_fn = send_message_fn
+        self._edit_message_fn = edit_message_fn
+        self._edit_markup_fn = edit_markup_fn
+        self.bot_username = bot_username
+
+    @staticmethod
+    def _is_ok(res: object) -> bool:
+        """A send is confirmed unless the transport explicitly reports ok=False."""
+        return not (isinstance(res, dict) and res.get("ok") is False)
+
+    @staticmethod
+    def _message_id_of(res: object) -> int | None:
+        """Extract ``result.message_id`` from a Bot API envelope, if present."""
+        if not isinstance(res, dict):
+            return None
+        result = res.get("result")
+        if not isinstance(result, dict):
+            return None
+        message_id = result.get("message_id")
+        return message_id if isinstance(message_id, int) else None
+
+    def _remember_control_message(self, notif: Notification, res: object) -> None:
+        """Track the newest keyboard-bearing group message as the control panel.
+
+        Nothing previously assigned ``control_message_id``, so every
+        ``edit_message_id`` was ``None`` and the panel could neither be edited
+        in place nor have its stale buttons stripped.  Recording it here -- the
+        one place that actually sees Telegram's response -- keeps the manager
+        free of I/O concerns.
+        """
+        if notif.channel != "group" or not notif.buttons:
+            return
+        message_id = self._message_id_of(res)
+        if message_id is None:
+            return
+        session = self._store.get(notif.target_id)
+        if session is not None:
+            session.control_message_id = message_id
+
+    async def dispatch_notifications(
+        self, notifications: list[Notification]
+    ) -> list[dict[str, Any]]:
+        """Dispatch notifications to Telegram, returning per-notification delivery status."""
+        results: list[dict[str, Any]] = []
+
+        for notif in notifications:
+            reply_markup = {"inline_keyboard": notif.buttons} if notif.buttons else None
+
+            if notif.disable_previous_message_id is not None and self._edit_markup_fn is not None:
+                try:
+                    await self._edit_markup_fn(
+                        notif.target_id, notif.disable_previous_message_id, None
+                    )
+                except Exception:
+                    pass
+
+            if (
+                notif.channel == "group"
+                and notif.edit_message_id is not None
+                and self._edit_message_fn is not None
+            ):
+                try:
+                    res = await self._edit_message_fn(
+                        notif.target_id, notif.edit_message_id, notif.text, reply_markup
+                    )
+                    if self._is_ok(res):
+                        results.append(
+                            {"target_id": notif.target_id, "channel": notif.channel, "ok": True, "res": res}
+                        )
+                        continue
+                    # An edit can legitimately fail (message too old, deleted,
+                    # or identical content).  Fall through to a fresh send so
+                    # the update still reaches the group.
+                except Exception:
+                    pass
+
+            try:
+                if self._send_message_fn is not None:
+                    res = await self._send_message_fn(notif.target_id, notif.text, reply_markup)
+                else:
+                    continue
+                ok = self._is_ok(res)
+                if ok:
+                    self._remember_control_message(notif, res)
+                results.append(
+                    {"target_id": notif.target_id, "channel": notif.channel, "ok": ok, "res": res}
+                )
+            except Exception as err:
+                results.append(
+                    {"target_id": notif.target_id, "channel": notif.channel, "ok": False, "error": str(err)}
+                )
+
+        return results
+
+    async def handle_newgame(
+        self, group_chat_id: int, user_id: int, display_name: str
+    ) -> OperationResult:
+        """Handle /newgame or launcher start."""
+        async with self._store.lock_for(group_chat_id):
+            res = self.session_manager.create_session(
+                group_chat_id, user_id, display_name, bot_username=self.bot_username
+            )
+        if res.notifications:
+            await self.dispatch_notifications(res.notifications)
+        return res
+
+    async def handle_join(
+        self, group_chat_id: int, user_id: int, display_name: str
+    ) -> OperationResult:
+        """Handle player join."""
+        async with self._store.lock_for(group_chat_id):
+            res = self.session_manager.join_session(
+                group_chat_id, user_id, display_name, bot_username=self.bot_username
+            )
+        if res.notifications:
+            await self.dispatch_notifications(res.notifications)
+        return res
+
+    async def handle_leave(self, group_chat_id: int, user_id: int) -> OperationResult:
+        """Handle player leave."""
+        async with self._store.lock_for(group_chat_id):
+            res = self.session_manager.leave_session(
+                group_chat_id, user_id, bot_username=self.bot_username
+            )
+        if res.notifications:
+            await self.dispatch_notifications(res.notifications)
+        return res
+
+    async def handle_startgame(self, group_chat_id: int, user_id: int) -> OperationResult:
+        """Handle round start with staged role delivery.
+
+        Role DMs are delivered first (outside the lock).  Only when every active
+        recipient is confirmed is the group readiness announcement sent.  A
+        partial delivery failure rolls the round back to the lobby and never
+        announces success, keeping the round unplayable.
+        """
+        async with self._store.lock_for(group_chat_id):
+            res = self.session_manager.start_session(
+                group_chat_id, user_id, bot_username=self.bot_username
+            )
+
+        if not res.ok:
+            if res.notifications:
+                await self.dispatch_notifications(res.notifications)
+            return res
+
+        # Staged delivery: send the private role DMs first (outside the lock).
+        # Only when every active recipient is confirmed do we announce readiness
+        # to the group.  A partial role-delivery failure rolls the round back to
+        # the lobby and never announces success, so the round stays unplayable.
+        group_notifs = [n for n in res.notifications if n.channel == "group"]
+        dm_notifs = [n for n in res.notifications if n.channel == "dm"]
+
+        dm_results = await self.dispatch_notifications(dm_notifs)
+        failed = [r["target_id"] for r in dm_results if not r["ok"]]
+
+        if failed:
+            async with self._store.lock_for(group_chat_id):
+                rollback = self.session_manager.rollback_failed_start(group_chat_id, failed)
+            if rollback.notifications:
+                await self.dispatch_notifications(rollback.notifications)
+            return rollback
+
+        if group_notifs:
+            await self.dispatch_notifications(group_notifs)
+
+        return res
+
+    async def handle_cancelgame(self, group_chat_id: int, user_id: int) -> OperationResult:
+        """Handle session cancellation."""
+        async with self._store.lock_for(group_chat_id):
+            res = self.session_manager.cancel_session(group_chat_id, user_id)
+        if res.notifications:
+            await self.dispatch_notifications(res.notifications)
+        return res
+
+    async def handle_start_voting(self, group_chat_id: int) -> OperationResult:
+        """Handle opening the voting panel."""
+        async with self._store.lock_for(group_chat_id):
+            res = self.session_manager.start_voting_panel(group_chat_id)
+        if res.notifications:
+            await self.dispatch_notifications(res.notifications)
+        return res
+
+    async def handle_spy_vote(
+        self, group_chat_id: int, voter_id: int, target_id: int
+    ) -> OperationResult:
+        """Handle vote submission."""
+        async with self._store.lock_for(group_chat_id):
+            res = self.session_manager.record_spy_vote(group_chat_id, voter_id, target_id)
+        if res.notifications:
+            await self.dispatch_notifications(res.notifications)
+        return res
+
+    async def handle_spy_guess(
+        self, group_chat_id: int, actor_id: int, word: str
+    ) -> OperationResult:
+        """Handle spy location guess submission."""
+        async with self._store.lock_for(group_chat_id):
+            res = self.session_manager.submit_spy_location_guess(group_chat_id, actor_id, word)
+        if res.notifications:
+            await self.dispatch_notifications(res.notifications)
+        return res
+
+    async def handle_spy_guess_menu(self, group_chat_id: int, actor_id: int) -> OperationResult:
+        """Show the exposed spy their one multiple-choice location ballot."""
+        async with self._store.lock_for(group_chat_id):
+            res = self.session_manager.build_spy_guess_menu(group_chat_id, actor_id)
+        if res.notifications:
+            await self.dispatch_notifications(res.notifications)
+        return res
+
+    async def handle_spy_guess_option(
+        self, group_chat_id: int, actor_id: int, option_index: int
+    ) -> OperationResult:
+        """Resolve a ballot button index to its word and submit it as the guess.
+
+        Index resolution and submission happen under the same lock, so a second
+        press cannot resolve against options that the first press already
+        consumed.
+        """
+        async with self._store.lock_for(group_chat_id):
+            word = self.session_manager.resolve_spy_guess_option(group_chat_id, option_index)
+            if word is None:
+                return OperationResult(
+                    ok=False,
+                    reason="invalid_option",
+                    alert_text="⚠️ هذا الخيار لم يعد متاحاً.",
+                    show_alert=True,
+                )
+            res = self.session_manager.submit_spy_location_guess(group_chat_id, actor_id, word)
+        if res.notifications:
+            await self.dispatch_notifications(res.notifications)
+        return res
+
+    def _build_status_panel_notification(self, group_chat_id: int, header: str) -> Notification:
+        """Build the current control panel notification (delegates to the manager)."""
+        return self.session_manager.build_status_panel_notification(group_chat_id, header)
+
+    async def handle_refresh_panel(self, group_chat_id: int) -> OperationResult:
+        """Resend the current control panel at the bottom of the chat."""
+        async with self._store.lock_for(group_chat_id):
+            session = self._store.get(group_chat_id)
+            if session is None:
+                return OperationResult(
+                    ok=False,
+                    reason="no_session",
+                    alert_text="⚠️ لا توجد لعبة نشطة في هذه المجموعة.",
+                    show_alert=True,
+                )
+            notif = self._build_status_panel_notification(
+                group_chat_id, "📌 <b>لوحة التحكم الحالية للعبة:</b>"
+            )
+            notif.disable_previous_message_id = session.control_message_id
+            notif.edit_message_id = None
+        await self.dispatch_notifications([notif])
+        return OperationResult(ok=True, alert_text="📌 تم إظهار اللوحة بالأسفل!", show_alert=False)
+
+    def mark_user_dm_ready(self, user_id: int) -> None:
+        """Mark user as DM ready."""
+        self.session_manager.mark_dm_ready(user_id)
+
+==============================================================================
+===== FILE: photo_guess_game/telegram_api.py =====
+==============================================================================
+
+"""Minimal async Telegram Bot API client built only on the standard library.
+
+Blocking ``urllib`` calls are pushed onto the default thread pool with
+``asyncio.to_thread``, which keeps the public surface fully awaitable without
+pulling in an HTTP dependency.  Avoiding third-party packages means the
+deployment has nothing to install and nothing to break on a version bump.
+
+Every method returns the decoded Telegram envelope (``{"ok": ..., ...}``)
+rather than raising on API-level failures, because the game's delivery logic
+distinguishes "the user blocked the bot" from "the network broke" and must be
+able to inspect ``ok`` itself.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import random
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_BASE_URL = "https://api.telegram.org"
+
+#: Long-poll window for getUpdates.  The socket timeout is deliberately larger
+#: so the server, not the client, decides when an empty poll ends.
+LONG_POLL_SECONDS = 25
+SOCKET_TIMEOUT_SECONDS = LONG_POLL_SECONDS + 15
+
+_MAX_ATTEMPTS = 4
+_BACKOFF_BASE_SECONDS = 1.5
+
+#: Telegram hard-caps a single message at 4096 UTF-16 code units.
+MAX_MESSAGE_LENGTH = 4096
+
+
+class TelegramAPI:
+    """Awaitable wrapper over the subset of Bot API methods the game needs."""
+
+    def __init__(
+        self,
+        token: str,
+        *,
+        base_url: str = DEFAULT_BASE_URL,
+        socket_timeout: float = SOCKET_TIMEOUT_SECONDS,
+    ) -> None:
+        if not token or ":" not in token:
+            raise ValueError(
+                "a Telegram bot token looks like '123456789:AA...'; "
+                "got something that cannot be one"
+            )
+        self._token = token
+        self._base_url = base_url.rstrip("/")
+        self._socket_timeout = socket_timeout
+
+    # ------------------------------------------------------------------
+    # Transport
+    # ------------------------------------------------------------------
+    def _endpoint(self, method: str) -> str:
+        return f"{self._base_url}/bot{self._token}/{method}"
+
+    def _post_blocking(self, method: str, payload: dict[str, Any]) -> dict[str, Any]:
+        body = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            self._endpoint(method),
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self._socket_timeout) as response:
+                raw = response.read()
+        except urllib.error.HTTPError as err:
+            # 4xx/5xx still carry a JSON Telegram envelope; surface it verbatim
+            # so callers can read description/parameters instead of guessing.
+            raw = err.read()
+            try:
+                return json.loads(raw.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                return {
+                    "ok": False,
+                    "error_code": err.code,
+                    "description": f"HTTP {err.code} with unparsable body",
+                }
+        return json.loads(raw.decode("utf-8"))
+
+    async def call(self, method: str, **payload: Any) -> dict[str, Any]:
+        """Invoke a Bot API method, retrying transient transport failures.
+
+        Retries cover network errors, 5xx responses, and 429 rate limits (using
+        Telegram's ``retry_after`` when present).  Application-level rejections
+        such as "bot was blocked by the user" are returned immediately, because
+        retrying them would only delay the caller's fallback path.
+        """
+        payload = {key: value for key, value in payload.items() if value is not None}
+        last_error: dict[str, Any] | None = None
+
+        for attempt in range(1, _MAX_ATTEMPTS + 1):
+            try:
+                result = await asyncio.to_thread(self._post_blocking, method, payload)
+            except (urllib.error.URLError, TimeoutError, OSError, ValueError) as err:
+                last_error = {"ok": False, "description": f"transport error: {err}"}
+            else:
+                if result.get("ok"):
+                    return result
+
+                error_code = result.get("error_code")
+                if error_code == 429:
+                    retry_after = 1.0
+                    parameters = result.get("parameters")
+                    if isinstance(parameters, dict):
+                        retry_after = float(parameters.get("retry_after", 1.0))
+                    logger.warning(
+                        "%s rate limited, sleeping %.1fs", method, retry_after
+                    )
+                    await asyncio.sleep(retry_after + 0.25)
+                    last_error = result
+                    continue
+                if isinstance(error_code, int) and 500 <= error_code < 600:
+                    last_error = result
+                else:
+                    # Deterministic rejection: no amount of retrying helps.
+                    return result
+
+            if attempt < _MAX_ATTEMPTS:
+                delay = _BACKOFF_BASE_SECONDS ** attempt + random.uniform(0, 0.4)
+                logger.warning(
+                    "%s failed (attempt %d/%d), retrying in %.1fs: %s",
+                    method,
+                    attempt,
+                    _MAX_ATTEMPTS,
+                    delay,
+                    (last_error or {}).get("description"),
+                )
+                await asyncio.sleep(delay)
+
+        return last_error or {"ok": False, "description": "exhausted retries"}
+
+    # ------------------------------------------------------------------
+    # Methods used by the game
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _clamp(text: str) -> str:
+        if len(text) <= MAX_MESSAGE_LENGTH:
+            return text
+        return text[: MAX_MESSAGE_LENGTH - 1] + "…"
+
+    async def get_me(self) -> dict[str, Any]:
+        """Fetch the bot account, used at boot to validate the token."""
+        return await self.call("getMe")
+
+    async def delete_webhook(self, *, drop_pending_updates: bool = False) -> dict[str, Any]:
+        """Remove any webhook so long polling is allowed to start."""
+        return await self.call(
+            "deleteWebhook", drop_pending_updates=drop_pending_updates
+        )
+
+    async def get_updates(
+        self, offset: int | None = None, *, timeout: int = LONG_POLL_SECONDS
+    ) -> dict[str, Any]:
+        """Long-poll for updates, limited to the types this bot reacts to."""
+        return await self.call(
+            "getUpdates",
+            offset=offset,
+            timeout=timeout,
+            allowed_updates=["message", "callback_query", "my_chat_member"],
+        )
+
+    async def send_message(
+        self,
+        chat_id: int,
+        text: str,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Send an HTML message; signature matches the adapter's send hook."""
+        return await self.call(
+            "sendMessage",
+            chat_id=chat_id,
+            text=self._clamp(text),
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+            disable_web_page_preview=True,
+        )
+
+    async def edit_message_text(
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Edit an existing message in place."""
+        return await self.call(
+            "editMessageText",
+            chat_id=chat_id,
+            message_id=message_id,
+            text=self._clamp(text),
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+            disable_web_page_preview=True,
+        )
+
+    async def edit_message_reply_markup(
+        self,
+        chat_id: int,
+        message_id: int,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Replace (or strip) the inline keyboard of an existing message."""
+        return await self.call(
+            "editMessageReplyMarkup",
+            chat_id=chat_id,
+            message_id=message_id,
+            reply_markup=reply_markup,
+        )
+
+    async def answer_callback_query(
+        self,
+        callback_query_id: str,
+        text: str | None = None,
+        *,
+        show_alert: bool = False,
+    ) -> dict[str, Any]:
+        """Acknowledge a button press, optionally with a toast or alert."""
+        return await self.call(
+            "answerCallbackQuery",
+            callback_query_id=callback_query_id,
+            text=text,
+            show_alert=show_alert,
+        )
+
+==============================================================================
+===== FILE: tests/test_end_to_end.py =====
+==============================================================================
+
+"""End-to-end coverage for the Spy Game flow against a fake Telegram API.
+
+Each test drives the real ``TelegramAdapter`` / ``SessionManager`` /
+``TimerService`` wiring that ``run_bot.py`` builds, substituting only the HTTP
+boundary.  Several tests are regressions for defects found during the audit and
+are labelled as such.
+
+Runnable with ``pytest tests/`` or directly with ``python tests/test_end_to_end.py``.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import sys
+from pathlib import Path
+from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from photo_guess_game.models import GameState, SessionKey  # noqa: E402
+from photo_guess_game.session_manager import SessionManager  # noqa: E402
+from photo_guess_game.session_store import SessionStore  # noqa: E402
+from photo_guess_game.telegram_adapter import TelegramAdapter  # noqa: E402
+from photo_guess_game.timer_service import TimerService  # noqa: E402
+
+GROUP = -1001234567890
+
+
+class FakeAPI:
+    """Records outbound calls and mimics Bot API envelopes."""
+
+    def __init__(self, blocked_users: set[int] | None = None) -> None:
+        self.blocked = blocked_users or set()
+        self.sent: list[dict[str, Any]] = []
+        self.edited: list[dict[str, Any]] = []
+        self.markup_edits: list[dict[str, Any]] = []
+        self._next_message_id = 1000
+
+    async def send_message(self, chat_id, text, reply_markup=None):
+        if chat_id in self.blocked:
+            return {
+                "ok": False,
+                "error_code": 403,
+                "description": "Forbidden: bot was blocked by the user",
+            }
+        self._next_message_id += 1
+        self.sent.append(
+            {"chat_id": chat_id, "text": text, "reply_markup": reply_markup}
+        )
+        return {"ok": True, "result": {"message_id": self._next_message_id}}
+
+    async def edit_message_text(self, chat_id, message_id, text, reply_markup=None):
+        self.edited.append(
+            {"chat_id": chat_id, "message_id": message_id, "text": text}
+        )
+        return {"ok": True, "result": {"message_id": message_id}}
+
+    async def edit_message_reply_markup(self, chat_id, message_id, reply_markup=None):
+        self.markup_edits.append({"chat_id": chat_id, "message_id": message_id})
+        return {"ok": True, "result": {"message_id": message_id}}
+
+    # -- assertions helpers -------------------------------------------
+    def texts_to(self, chat_id: int) -> list[str]:
+        return [call["text"] for call in self.sent if call["chat_id"] == chat_id]
+
+    def all_texts(self) -> str:
+        return "\n".join(call["text"] for call in self.sent) + "\n".join(
+            call["text"] for call in self.edited
+        )
+
+
+class ManualScheduler:
+    """Deterministic ``call_later`` replacement; nothing fires until asked."""
+
+    class Handle:
+        def __init__(self) -> None:
+            self.cancelled = False
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+    def __init__(self) -> None:
+        self.jobs: list[tuple[float, Any, ManualScheduler.Handle]] = []
+
+    def __call__(self, delay, callback):
+        handle = self.Handle()
+        self.jobs.append((delay, callback, handle))
+        return handle
+
+    def fire_longest(self) -> bool:
+        """Fire the live job with the largest delay (the round deadline)."""
+        live = [job for job in self.jobs if not job[2].cancelled]
+        if not live:
+            return False
+        delay, callback, _ = max(live, key=lambda job: job[0])
+        callback()
+        return True
+
+    @property
+    def live_count(self) -> int:
+        return sum(1 for job in self.jobs if not job[2].cancelled)
+
+
+def build(blocked: set[int] | None = None, *, round_seconds: int = 300):
+    """Assemble the same object graph run_bot.py wires up."""
+    api = FakeAPI(blocked)
+    store = SessionStore()
+    scheduler = ManualScheduler()
+    collected: list[Any] = []
+    timers = TimerService(
+        scheduler=scheduler,
+        session_lookup=lambda key: store.get(key.group_chat_id),
+    )
+    manager = SessionManager(
+        store,
+        timer_service=timers,
+        on_notification_cb=collected.extend,
+        round_seconds=round_seconds,
+    )
+    adapter = TelegramAdapter(
+        store,
+        session_manager=manager,
+        timer_service=timers,
+        send_message_fn=api.send_message,
+        edit_message_fn=api.edit_message_text,
+        edit_markup_fn=api.edit_message_reply_markup,
+    )
+    return api, store, adapter, manager, timers, scheduler, collected
+
+
+async def open_lobby(adapter, players: list[tuple[int, str]]):
+    host_id, host_name = players[0]
+    await adapter.handle_newgame(GROUP, host_id, host_name)
+    for user_id, name in players[1:]:
+        await adapter.handle_join(GROUP, user_id, name)
+
+
+# ----------------------------------------------------------------------
+# Happy path
+# ----------------------------------------------------------------------
+def test_full_round_spy_caught_then_guesses_correctly():
+    async def scenario():
+        api, store, adapter, manager, timers, scheduler, _ = build()
+        players = [(1, "سالم"), (2, "ليان"), (3, "عمر")]
+        await open_lobby(adapter, players)
+
+        session = store.get(GROUP)
+        assert session.state is GameState.LOBBY
+        assert len(session.players) == 3
+
+        res = await adapter.handle_startgame(GROUP, 1)
+        assert res.ok, res.reason
+        assert session.state is GameState.GUESSING
+
+        # Every active player received exactly one role DM.
+        for user_id, _ in players:
+            assert len(api.texts_to(user_id)) == 1, user_id
+
+        spy_id = session.spy_user_id
+        citizens = [uid for uid, _ in players if uid != spy_id]
+        # The spy is told they are the spy; citizens receive the secret word.
+        assert "أنت الجاسوس" in api.texts_to(spy_id)[0]
+        for uid in citizens:
+            assert session.secret_location_name in api.texts_to(uid)[0]
+
+        # Two round timers are armed for this exact generation.
+        assert timers.pending_for(session.session_key) == 2
+
+        assert (await adapter.handle_start_voting(GROUP)).ok
+        assert session.voting_active is True
+
+        # Everyone votes for the spy; the ballot resolves on the last vote.
+        for uid, _ in players:
+            vote_res = await adapter.handle_spy_vote(GROUP, uid, spy_id)
+            assert vote_res.ok, vote_res.reason
+
+        assert session.spy_guessing_active is True
+        assert "تم كشف الجاسوس" in api.all_texts()
+
+        menu = await adapter.handle_spy_guess_menu(GROUP, spy_id)
+        assert menu.ok, menu.reason
+        options = list(session.spy_guess_options)
+        assert len(options) == 4
+        correct_index = options.index(session.secret_location_word)
+
+        guess = await adapter.handle_spy_guess_option(GROUP, spy_id, correct_index)
+        assert guess.ok, guess.reason
+        assert session.state is GameState.COMPLETED
+        assert "تخمين عبقري" in api.all_texts()
+        # Terminal sessions must release their timers.
+        assert timers.pending_for(SessionKey(GROUP, session.generation)) == 0
+
+    asyncio.run(scenario())
+
+
+def test_only_the_spy_may_open_the_guess_menu():
+    async def scenario():
+        api, store, adapter, *_ = build()
+        players = [(1, "سالم"), (2, "ليان"), (3, "عمر")]
+        await open_lobby(adapter, players)
+        await adapter.handle_startgame(GROUP, 1)
+        session = store.get(GROUP)
+        spy_id = session.spy_user_id
+        await adapter.handle_start_voting(GROUP)
+        for uid, _ in players:
+            await adapter.handle_spy_vote(GROUP, uid, spy_id)
+
+        innocent = next(uid for uid, _ in players if uid != spy_id)
+        denied = await adapter.handle_spy_guess_menu(GROUP, innocent)
+        assert not denied.ok
+        assert denied.reason == "not_spy"
+
+        # And the ballot cannot be consumed twice.
+        await adapter.handle_spy_guess_menu(GROUP, spy_id)
+        assert len(session.spy_guess_options) == 4, "menu did not populate options"
+        first = await adapter.handle_spy_guess_option(GROUP, spy_id, 0)
+        assert first.ok
+        second = await adapter.handle_spy_guess_option(GROUP, spy_id, 0)
+        assert not second.ok, "a second guess was accepted"
+
+    asyncio.run(scenario())
+
+
+# ----------------------------------------------------------------------
+# Regressions
+# ----------------------------------------------------------------------
+def test_timeout_reveals_spy_and_location_not_photo_owners():
+    """Regression: enter_reveal used to disclose photo labels.
+
+    ``session.labels`` is always empty in the spy game, so the timeout message
+    was a bare "أصحاب الصور الحقيقيين" header with no spy and no location.
+    """
+
+    async def scenario():
+        api, store, adapter, manager, timers, scheduler, collected = build()
+        await open_lobby(adapter, [(1, "سالم"), (2, "ليان"), (3, "عمر")])
+        await adapter.handle_startgame(GROUP, 1)
+        session = store.get(GROUP)
+        spy_name = session.players[session.spy_user_id].display_name
+        secret_name = session.secret_location_name
+
+        assert scheduler.fire_longest(), "round deadline was never scheduled"
+
+        assert session.state is GameState.COMPLETED
+        text = "\n".join(n.text for n in collected)
+        assert "انتهى الوقت ولم يُكشف الجاسوس" in text
+        assert spy_name in text
+        assert secret_name in text
+        assert "فاز الجاسوس" in text
+        assert "الصور" not in text, "photo-game wording leaked into the reveal"
+
+    asyncio.run(scenario())
+
+
+def test_failed_role_dm_rolls_round_back_to_lobby():
+    """A blocked DM must leave the round unplayable, never announced as ready."""
+
+    async def scenario():
+        api, store, adapter, *_ = build(blocked={3})
+        await open_lobby(adapter, [(1, "سالم"), (2, "ليان"), (3, "عمر")])
+        res = await adapter.handle_startgame(GROUP, 1)
+
+        assert not res.ok
+        assert res.reason == "role_delivery_failed"
+        session = store.get(GROUP)
+        assert session.state is GameState.LOBBY
+        assert session.spy_user_id is None
+        assert session.secret_location_name == ""
+        assert all(not p.is_spy and p.secret_word is None for p in session.players.values())
+
+        group_text = "\n".join(api.texts_to(GROUP)) + "\n".join(
+            c["text"] for c in api.edited
+        )
+        assert "فشل إرسال الكلمات السرية" in group_text
+        assert "تم توزيع الكلمات السرية" not in group_text
+
+    asyncio.run(scenario())
+
+
+def test_timer_from_previous_generation_cannot_touch_a_new_session():
+    """Regression: the legacy timer API pinned generation 0, which never matched.
+
+    Wiring ``session_lookup`` therefore used to reject every timer silently.
+    Now timers carry the real generation and only stale ones are refused.
+    """
+
+    async def scenario():
+        api, store, adapter, manager, timers, scheduler, collected = build()
+        await open_lobby(adapter, [(1, "سالم"), (2, "ليان"), (3, "عمر")])
+        await adapter.handle_startgame(GROUP, 1)
+        first = store.get(GROUP)
+        first_key = first.session_key
+        stale_deadline = max(
+            (job for job in scheduler.jobs if not job[2].cancelled),
+            key=lambda job: job[0],
+        )
+
+        # Cancel the game and start a brand-new one in the same group.
+        await adapter.handle_cancelgame(GROUP, 1)
+        await open_lobby(adapter, [(1, "سالم"), (2, "ليان"), (3, "عمر")])
+        await adapter.handle_startgame(GROUP, 1)
+        second = store.get(GROUP)
+
+        assert second.generation > first_key.generation
+        assert second.session_key != first_key
+
+        collected.clear()
+        # Fire the *old* round's deadline callback directly.
+        stale_deadline[1]()
+
+        assert second.state is GameState.GUESSING, "stale timer ended the new round"
+        assert collected == [], "stale timer produced output"
+
+    asyncio.run(scenario())
+
+
+def test_control_message_id_is_recorded_from_send_response():
+    """Regression: nothing ever assigned control_message_id, so edits no-oped."""
+
+    async def scenario():
+        api, store, adapter, *_ = build()
+        await adapter.handle_newgame(GROUP, 1, "سالم")
+        session = store.get(GROUP)
+        assert session.control_message_id is not None
+
+        before = session.control_message_id
+        await adapter.handle_join(GROUP, 2, "ليان")
+        # The lobby update targets the tracked panel via editMessageText.
+        assert any(call["message_id"] == before for call in api.edited)
+
+    asyncio.run(scenario())
+
+
+def test_second_newgame_is_rejected_while_a_round_is_live():
+    async def scenario():
+        api, store, adapter, *_ = build()
+        await open_lobby(adapter, [(1, "سالم"), (2, "ليان")])
+        res = await adapter.handle_newgame(GROUP, 9, "دخيل")
+        assert not res.ok
+        assert res.reason == "session_already_active"
+        assert len(store.get(GROUP).players) == 2
+
+    asyncio.run(scenario())
+
+
+def test_location_library_has_no_padding_or_duplicate_words():
+    """Regression: the library was padded to 500 with synthetic '#N' clones."""
+    from photo_guess_game.locations import LOCATIONS
+
+    words = [entry["word"] for entry in LOCATIONS]
+    assert len(words) == len(set(words)), "duplicate secret words"
+    assert not any("#" in entry["name"] for entry in LOCATIONS)
+    assert not any("_" in entry["word"] and entry["word"][-1].isdigit() for entry in LOCATIONS)
+
+
+def test_session_exposes_generation_bound_guard_fields():
+    """timer_service reads .terminal/.session_key/.phase/.revision on sessions."""
+    from photo_guess_game.models import RoundPhase
+
+    store = SessionStore()
+    manager = SessionManager(store)
+    manager.create_session(GROUP, 1, "سالم")
+    session = store.get(GROUP)
+
+    assert session.session_key == SessionKey(GROUP, session.generation)
+    assert session.terminal is False
+    assert session.phase is RoundPhase.LOBBY
+    assert session.revision >= 1
+
+    manager.cancel_session(GROUP, 1)
+    assert store.get(GROUP).terminal is True
+    assert store.get(GROUP).phase is None
+
+
+if __name__ == "__main__":
+    failures = 0
+    for name, fn in sorted(globals().items()):
+        if not name.startswith("test_") or not callable(fn):
+            continue
+        try:
+            fn()
+        except Exception as err:  # noqa: BLE001 - standalone runner
+            failures += 1
+            print(f"FAIL {name}: {type(err).__name__}: {err}")
+            import traceback
+
+            traceback.print_exc()
+        else:
+            print(f"ok   {name}")
+    print(f"\n{failures} failure(s)")
+    raise SystemExit(1 if failures else 0)
+
+==============================================================================
+===== FILE: tests/test_run_bot_boot.py =====
+==============================================================================
+
+"""Boots the real run_bot.py process against a stub Bot API.
+
+Verifies the parts unit tests cannot reach: token handling, getMe validation,
+webhook clearing, the polling loop, update routing, the Render health endpoint,
+and clean SIGTERM shutdown.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+PYTHON = sys.executable
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _wait_for_port(port: int, timeout: float = 10.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with socket.socket() as sock:
+            sock.settimeout(0.3)
+            if sock.connect_ex(("127.0.0.1", port)) == 0:
+                return True
+        time.sleep(0.1)
+    return False
+
+
+def test_missing_token_exits_with_guidance():
+    env = {k: v for k, v in os.environ.items() if k != "BOT_TOKEN"}
+    proc = subprocess.run(
+        [PYTHON, "run_bot.py"],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 2
+    assert "BOT_TOKEN is not set" in proc.stderr
+    # The message must point at the dashboard, not at editing source.
+    assert "Environment" in proc.stderr
+
+
+def test_boots_polls_routes_updates_and_stops_cleanly():
+    stub_port = _free_port()
+    health_port = _free_port()
+
+    stub = subprocess.Popen(
+        [PYTHON, str(Path(__file__).parent / "stub_telegram_server.py"), str(stub_port)],
+        cwd=ROOT,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    bot = None
+    try:
+        assert _wait_for_port(stub_port), "stub API never came up"
+
+        env = dict(os.environ)
+        env.update(
+            {
+                "BOT_TOKEN": "123456789:AAstub-token-for-tests",
+                "TELEGRAM_API_BASE": f"http://127.0.0.1:{stub_port}",
+                "PORT": str(health_port),
+                "ROUND_SECONDS": "60",
+                "LOG_LEVEL": "INFO",
+            }
+        )
+        bot = subprocess.Popen(
+            [PYTHON, "run_bot.py"],
+            cwd=ROOT,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+
+        assert _wait_for_port(health_port), "health endpoint never bound $PORT"
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{health_port}/", timeout=5
+        ) as response:
+            assert response.status == 200
+            assert b"polling" in response.read()
+
+        # Give the loop time to consume the scripted updates.
+        deadline = time.monotonic() + 20
+        calls: list[str] = []
+        while time.monotonic() < deadline:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{stub_port}/__calls", timeout=5
+            ) as response:
+                calls = json.loads(response.read())["calls"]
+            if any(c.startswith("sendMessage:chat=-100999") for c in calls):
+                break
+            time.sleep(0.5)
+
+        assert "getMe" in calls, "token was never validated"
+        assert "deleteWebhook" in calls, "stale webhook was not cleared"
+        assert "getUpdates" in calls, "polling never started"
+        # /newgame in the group produced the lobby announcement.
+        assert any(c == "sendMessage:chat=-100999" for c in calls), calls
+        # /start in private produced the DM-ready confirmation.
+        assert any(c == "sendMessage:chat=501" for c in calls), calls
+        # The join button press was acknowledged.
+        assert "answerCallbackQuery" in calls, calls
+
+        bot.send_signal(signal.SIGTERM)
+        stdout, _ = bot.communicate(timeout=45)
+        assert bot.returncode == 0, stdout
+        assert "authenticated as @stubbot" in stdout
+        assert "shutting down" in stdout
+    finally:
+        for proc in (bot, stub):
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=10)
+
+
+if __name__ == "__main__":
+    test_missing_token_exits_with_guidance()
+    print("ok   test_missing_token_exits_with_guidance")
+    test_boots_polls_routes_updates_and_stops_cleanly()
+    print("ok   test_boots_polls_routes_updates_and_stops_cleanly")
+
+==============================================================================
+===== FILE: tests/stub_telegram_server.py =====
+==============================================================================
+
+"""A throwaway Bot API stub used to boot run_bot.py without touching Telegram.
+
+Serves just enough of the Bot API for the entry point to authenticate, poll a
+scripted set of updates, and shut down.  Started as a subprocess by
+``test_run_bot_boot.py``; not part of the deployed code.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+GROUP = -100999
+HOST_ID = 501
+
+#: Delivered on the first getUpdates poll, then never again.
+SCRIPTED_UPDATES = [
+    {
+        "update_id": 1,
+        "message": {
+            "message_id": 11,
+            "chat": {"id": GROUP, "type": "supergroup"},
+            "from": {"id": HOST_ID, "first_name": "سالم"},
+            "text": "/newgame",
+        },
+    },
+    {
+        "update_id": 2,
+        "message": {
+            "message_id": 12,
+            "chat": {"id": HOST_ID, "type": "private"},
+            "from": {"id": HOST_ID, "first_name": "سالم"},
+            "text": "/start",
+        },
+    },
+    {
+        "update_id": 3,
+        "callback_query": {
+            "id": "cb1",
+            "from": {"id": 502, "first_name": "ليان"},
+            "message": {"message_id": 13, "chat": {"id": GROUP, "type": "supergroup"}},
+            "data": "join_game",
+        },
+    },
+]
+
+calls: list[str] = []
+_message_id = 5000
+
+
+class Handler(BaseHTTPRequestHandler):
+    def _reply(self, payload: dict) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path == "/__calls":
+            self._reply({"calls": calls})
+        else:
+            self._reply({"ok": False, "description": "unsupported"})
+
+    def do_POST(self) -> None:  # noqa: N802
+        global _message_id
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except ValueError:
+            payload = {}
+
+        method = self.path.rsplit("/", 1)[-1]
+        calls.append(method)
+
+        if method == "getMe":
+            self._reply({"ok": True, "result": {"id": 1, "username": "stubbot"}})
+        elif method == "deleteWebhook":
+            self._reply({"ok": True, "result": True})
+        elif method == "getUpdates":
+            # Serve the script once; afterwards report no updates so the loop
+            # idles instead of replaying.
+            if "getUpdates_served" not in calls:
+                calls.append("getUpdates_served")
+                self._reply({"ok": True, "result": SCRIPTED_UPDATES})
+            else:
+                self._reply({"ok": True, "result": []})
+        elif method in ("sendMessage", "editMessageText", "editMessageReplyMarkup"):
+            _message_id += 1
+            calls.append(f"{method}:chat={payload.get('chat_id')}")
+            self._reply({"ok": True, "result": {"message_id": _message_id}})
+        elif method == "answerCallbackQuery":
+            self._reply({"ok": True, "result": True})
+        else:
+            self._reply({"ok": False, "description": f"stub has no {method}"})
+
+    def log_message(self, *_args) -> None:
+        """Quiet."""
+
+
+def main() -> None:
+    port = int(sys.argv[1])
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
+
+==============================================================================
+ END OF BUNDLE
+==============================================================================

@@ -1,7 +1,19 @@
-"""Telegram photo-guessing party game.
+"""Telegram Spy Game (لعبة الجاسوس والكلمة السرية).
 
-Pure, side-effect-free game-logic components (Session_Manager,
-Photo_Distributor, Guess_Tracker, Score_Tracker, Timer_Service) layered
-underneath a thin Telegram adapter. See .kiro/specs/telegram-photo-guess-game
-for the requirements and design documents.
+Layering, innermost first:
+
+``models``          plain dataclasses; no I/O, no imports from siblings.
+``locations``       the curated secret-word library.
+``session_store``   in-memory session storage, per-group locks, generations.
+``session_manager`` the rules engine. Every method is synchronous and returns
+                    an ``OperationResult`` describing what should be sent; it
+                    never performs I/O itself.
+``timer_service``   generation-bound timer registry over an injected scheduler.
+``telegram_adapter``the I/O boundary. Runs a decision under the group lock,
+                    then performs every network send outside the lock.
+``telegram_api``    stdlib-only Bot API client (no third-party dependencies).
+
+The package name is historical: this codebase began as a photo-guessing game.
+The photo-specific components (score/guess trackers, photo labels) were removed
+once the game became the spy game; see git history if they are ever needed.
 """

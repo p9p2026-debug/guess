@@ -1,1 +1,8 @@
-httpx>=0.27.0
+# This project intentionally has zero third-party dependencies.
+#
+# The Telegram Bot API client (photo_guess_game/telegram_api.py) is built on the
+# standard library (urllib + asyncio), so there is nothing to install, nothing
+# to pin, and no dependency that can break on a future release.
+#
+# The file is kept because Render's Python runtime looks for it to detect a
+# Python service. Leave it empty unless a real dependency is added.

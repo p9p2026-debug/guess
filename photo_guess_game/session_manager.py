@@ -6,33 +6,80 @@ import html
 import random
 import time
 import uuid
+from typing import Callable
+
 from .locations import LocationEntry, get_location_options, get_random_location
-from .models import GameSession, GameState, Notification, OperationResult, Player
+from .models import (
+    GameSession,
+    GameState,
+    Notification,
+    OperationResult,
+    Player,
+    RoundPhase,
+)
 from .session_store import SessionStore, _NON_TERMINAL_STATES
+
+MIN_PLAYERS_TO_START = 2
+MIN_PLAYERS_TO_VOTE = 3
+MAX_PLAYERS = 15
+DEFAULT_TIMEOUT_SECONDS = 300
+SPY_GUESS_OPTION_COUNT = 4
+
+LOBBY_BUTTONS = [
+    [
+        {"text": "➕ انضمام للعبة", "callback_data": "join_game"},
+        {"text": "🚪 مغادرة اللعبة", "callback_data": "leave_game"},
+    ],
+    [
+        {"text": "🚀 بدء اللعبة", "callback_data": "start_game"},
+        {"text": "❌ إلغاء اللعبة", "callback_data": "cancel_game"},
+    ],
+    [{"text": "📌 أظهر لوحة الأزرار بالأسفل", "callback_data": "refresh_panel"}],
+]
+
+ACTIVE_PANEL_BUTTONS = [
+    [{"text": "🗳️ بدء التصويت على الجاسوس", "callback_data": "start_voting"}],
+    [{"text": "💡 تخمين الكلمة السرية (الجاسوس)", "callback_data": "spy_guess_menu"}],
+    [{"text": "📌 أظهر لوحة الأزرار بالأسفل", "callback_data": "refresh_panel"}],
+]
 
 
 class SessionManager:
     """Core state machine and rules engine for Spy Game."""
 
-    def __init__(self, store: SessionStore) -> None:
+    def __init__(
+        self,
+        store: SessionStore,
+        timer_service=None,
+        on_notification_cb: Callable[[list[Notification]], None] | None = None,
+        timeout_dispatcher: Callable[[str, int], None] | None = None,
+        round_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+    ) -> None:
         self._store = store
+        self._timer_service = timer_service
+        self._on_notification_cb = on_notification_cb
+        self._timeout_dispatcher = timeout_dispatcher
+        self._round_seconds = round_seconds
 
     @staticmethod
     def generate_game_id() -> str:
         """Generate a short 4-character hex game_id."""
         return uuid.uuid4().hex[:4]
 
+    # ------------------------------------------------------------------
+    # Lobby lifecycle
+    # ------------------------------------------------------------------
     def create_session(
         self, group_chat_id: int, host_id: int, host_name: str, bot_username: str = "guessJobot"
     ) -> OperationResult:
-        """Initialize a new GameSession in LOBBY state."""
+        """Initialize a new GameSession in LOBBY state.
+
+        Rejects the request without mutation when a non-terminal session
+        already exists for the group, regardless of age, so an active lobby
+        or round is never silently replaced.
+        """
         existing = self._store.get(group_chat_id)
-        current_time = time.time()
-        if (
-            existing is not None
-            and existing.state in _NON_TERMINAL_STATES
-            and (current_time - existing.last_activity_at < 3600)
-        ):
+        if existing is not None and existing.state in _NON_TERMINAL_STATES:
             return OperationResult(
                 ok=False,
                 reason="session_already_active",
@@ -41,24 +88,24 @@ class SessionManager:
                 session=existing,
             )
 
+        current_time = time.time()
         clean_host_name = html.escape(host_name)
         host = Player(user_id=host_id, display_name=clean_host_name, joined_at=current_time)
-        game_id = self.generate_game_id()
-
         session = GameSession(
-            game_id=game_id,
+            game_id=self.generate_game_id(),
             group_chat_id=group_chat_id,
             host_id=host_id,
             state=GameState.LOBBY,
             players={host_id: host},
             created_at=current_time,
             last_activity_at=current_time,
-            min_players=3,
-            max_players=15,
+            min_players=MIN_PLAYERS_TO_START,
+            max_players=MAX_PLAYERS,
+            generation=self._store.next_generation(group_chat_id),
+            guessing_timeout_seconds=self._round_seconds,
         )
         self._store.put(session)
 
-        buttons = self._build_lobby_buttons(session, bot_username)
         announcement = Notification(
             channel="group",
             target_id=group_chat_id,
@@ -66,30 +113,23 @@ class SessionManager:
                 f"🕵️ <b>{clean_host_name}</b> بدأ لعبة <b>الجاسوس والكلمة السرية</b>!\n\n"
                 "<blockquote expandable>\n"
                 "<b>💡 فكرة اللعبة:</b>\n"
-                "البوت يرسل كلمة سرية واحدة بالخاص لجميع المواطنين، ولكنه يختار شخصاً واحداً ليكون <b>الجاسوس 🕵️</b> (لا يعرف الكلمة!).\n"
+                "البوت يرسل كلمة سرية واحدة بالخاص لجميع اللاعبين، ولكنه يختار شخصاً واحداً "
+                "ليكون <b>الجاسوس 🕵️</b> (لا يعرف الكلمة!).\n"
                 "اطرحوا أسئلة على بعضكم في المحادثة لاكتشاف الجاسوس دون إفشاء الكلمة السرية!\n"
                 "</blockquote>\n\n"
                 "<b>📋 طريقة اللعب:</b>\n"
-                "1️⃣ اضغط <b>💬 تفعيل الخاص مع البوت</b> بالأسفل أولاً.\n"
-                "2️⃣ اضغط <b>➕ انضمام للعبة</b>.\n"
-                "3️⃣ اضغط <b>🚀 بدء اللعبة</b> لتلقي الدور بالخاص!\n\n"
-                f"👥 <b>اللوبي مفتوح:</b> (1/{session.max_players} لاعبين - الحد الأدنى: {session.min_players})"
+                "1️⃣ اضغط <b>➕ انضمام للعبة</b> أدناه.\n"
+                "2️⃣ اضغط <b>🚀 بدء اللعبة</b> للتصويت وتلقي الكلمات السرية بالخاص!\n\n"
+                f"👥 <b>اللوبي مفتوح الآن:</b> ({len(session.players)}/{session.max_players} لاعبين)"
             ),
-            buttons=buttons,
+            buttons=[list(row) for row in LOBBY_BUTTONS],
         )
         return OperationResult(ok=True, notifications=[announcement], session=session)
-
-    def mark_dm_ready(self, user_id: int) -> None:
-        """Mark a user as having DM enabled across active sessions."""
-        for session in list(self._store._sessions.values()):
-            if user_id in session.players:
-                session.players[user_id].dm_ready = True
-                self._store.put(session)
 
     def join_session(
         self, group_chat_id: int, user_id: int, display_name: str, bot_username: str = "guessJobot"
     ) -> OperationResult:
-        """Add a player to LOBBY state session."""
+        """Add a player to a LOBBY state session."""
         session = self._store.get(group_chat_id)
         if session is None or session.state != GameState.LOBBY:
             return OperationResult(
@@ -124,18 +164,14 @@ class SessionManager:
         )
         self._store.put(session)
 
-        buttons = self._build_lobby_buttons(session, bot_username)
-        players_list = ", ".join([p.display_name for p in session.players.values()])
-        text = (
-            f"➕ <b>{clean_name}</b> انضم للعبة!\n\n"
-            f"👥 <b>اللاعبون ({len(session.players)}/{session.max_players}):</b> {players_list}"
-        )
-
         notif = Notification(
             channel="group",
             target_id=group_chat_id,
-            text=text,
-            buttons=buttons,
+            text=(
+                f"👤 <b>{clean_name}</b> انضم للعبة! "
+                f"({len(session.players)}/{session.max_players} لاعبين)"
+            ),
+            buttons=[list(row) for row in LOBBY_BUTTONS],
             edit_message_id=session.control_message_id,
         )
         return OperationResult(ok=True, notifications=[notif], session=session)
@@ -143,7 +179,7 @@ class SessionManager:
     def leave_session(
         self, group_chat_id: int, user_id: int, bot_username: str = "guessJobot"
     ) -> OperationResult:
-        """Remove a player from LOBBY state session."""
+        """Remove a player from a LOBBY state session."""
         session = self._store.get(group_chat_id)
         if session is None or session.state != GameState.LOBBY:
             return OperationResult(
@@ -164,44 +200,65 @@ class SessionManager:
             )
 
         departing = session.players.pop(user_id)
+
         if not session.players:
             session.state = GameState.CANCELLED
             self._store.put(session)
             notif = Notification(
                 channel="group",
                 target_id=group_chat_id,
-                text=f"🚪 غادر <b>{departing.display_name}</b> ولم يبقَ أي لاعب — تم إلغاء اللعبة.",
-                edit_message_id=session.control_message_id,
+                text=f"🚪 {departing.display_name} غادر اللعبة ولم يبقَ أي لاعب — تم إلغاء اللعبة.",
+                buttons=[list(row) for row in LOBBY_BUTTONS],
             )
             return OperationResult(ok=True, notifications=[notif], session=session)
 
+        host_transferred = False
         if departing.user_id == session.host_id:
             oldest_player = min(session.players.values(), key=lambda p: p.joined_at)
             session.host_id = oldest_player.user_id
+            host_transferred = True
 
         self._store.put(session)
-        buttons = self._build_lobby_buttons(session, bot_username)
-        players_list = ", ".join([p.display_name for p in session.players.values()])
-        host_p = session.players[session.host_id]
 
-        text = (
-            f"🚪 غادر <b>{departing.display_name}</b> اللعبة.\n"
-            f"👑 <b>منشئ اللعبة الحالي:</b> {host_p.display_name}\n"
-            f"👥 <b>اللاعبون ({len(session.players)}/{session.max_players}):</b> {players_list}"
-        )
+        if host_transferred:
+            new_host = session.players[session.host_id]
+            text = (
+                f"🚪 {departing.display_name} غادر اللعبة.\n"
+                f"أصبح <b>{new_host.display_name}</b> منشئ اللعبة (Host) الآن."
+            )
+        else:
+            text = (
+                f"🚪 {departing.display_name} غادر اللعبة. "
+                f"({len(session.players)}/{session.max_players} لاعبين)"
+            )
+
         notif = Notification(
             channel="group",
             target_id=group_chat_id,
             text=text,
-            buttons=buttons,
+            buttons=[list(row) for row in LOBBY_BUTTONS],
             edit_message_id=session.control_message_id,
         )
         return OperationResult(ok=True, notifications=[notif], session=session)
 
+    def mark_dm_ready(self, user_id: int) -> None:
+        """Mark a user as having DM enabled across active sessions."""
+        for session in list(self._store._sessions.values()):
+            if user_id in session.players:
+                session.players[user_id].dm_ready = True
+
+    # ------------------------------------------------------------------
+    # Round start
+    # ------------------------------------------------------------------
     def start_session(
         self, group_chat_id: int, requester_id: int, bot_username: str = "guessJobot"
     ) -> OperationResult:
-        """Validate requirements and transition LOBBY session to DEALING state."""
+        """Validate requirements and transition a LOBBY session to GUESSING.
+
+        Assigns roles and the secret word once, produces the group readiness
+        announcement followed by one private role message per active player,
+        and schedules the one-shot round timers.
+        """
         session = self._store.get(group_chat_id)
         if session is None or session.state != GameState.LOBBY:
             return OperationResult(
@@ -222,65 +279,52 @@ class SessionManager:
             )
 
         active_players = [p for p in session.players.values() if p.active]
-        if len(active_players) < session.min_players:
+        if len(active_players) < MIN_PLAYERS_TO_START:
             return OperationResult(
                 ok=False,
                 reason="below_minimum",
-                alert_text=f"⚠️ يلزم وجود {session.min_players} لاعبين على الأقل لبدء اللعبة!",
+                alert_text=f"⚠️ يلزم وجود {MIN_PLAYERS_TO_START} لاعبين على الأقل لبدء اللعبة!",
                 show_alert=True,
                 session=session,
             )
 
-        # Check DM readiness
-        unready_players = [p for p in active_players if not p.dm_ready]
-        if unready_players:
-            unready_names = ", ".join([p.display_name for p in unready_players])
-            buttons = [
-                [{"text": "💬 اضغط هنا لتفعيل الخاص مع البوت", "url": f"https://t.me/{bot_username}"}],
-                [{"text": "📌 أظهر لوحة الأزرار بالأسفل", "callback_data": f"sg:{session.game_id}:r{session.round_number}:ref"}],
-            ]
-            notif = Notification(
-                channel="group",
-                target_id=group_chat_id,
-                text=(
-                    f"⚠️ <b>لا يمكن بدء اللعبة قبل تفعيل الخاص!</b>\n\n"
-                    f"اللاعبون التالية أسماؤهم لم يفعلوا الخاص مع البوت بعد:\n"
-                    f"👉 <b>{unready_names}</b>\n\n"
-                    f"يرجى الضغط على الزر بالأسفل والضغط على <b>Start</b> بالخاص ثم محاولة البدء مجدداً!"
-                ),
-                buttons=buttons,
-                edit_message_id=session.control_message_id,
-            )
-            return OperationResult(
-                ok=False,
-                reason="dm_unready",
-                alert_text="⚠️ هناك لاعبون لم يفعلوا الخاص مع البوت بعد!",
-                show_alert=True,
-                notifications=[notif],
-                session=session,
-            )
-
-        session.state = GameState.DEALING
         loc = get_random_location()
         session.secret_location_name = loc["name"]
         session.secret_location_word = loc["word"]
-        session.secret_category = loc["category"]
+        session.secret_category = loc.get("category", "")
 
         active_uids = [p.user_id for p in active_players]
         spy_uid = random.choice(active_uids)
         session.spy_user_id = spy_uid
         session.votes.clear()
         session.eligible_vote_targets = active_uids.copy()
+        session.voting_active = False
+        session.spy_guessing_active = False
+        session.spy_guess_attempted = False
+        session.state = GameState.GUESSING
 
-        dm_notifications: list[Notification] = []
-        for p in active_players:
-            if p.user_id == spy_uid:
-                p.is_spy = True
-                p.secret_word = None
-                dm_notifications.append(
+        group_announcement = Notification(
+            channel="group",
+            target_id=group_chat_id,
+            text=(
+                "🕵️ <b>تم توزيع الكلمات السرية بالخاص لجميع اللاعبين!</b>\n\n"
+                "• هناك <b>جاسوس واحد</b> بينكم لا يعرف الكلمة السرية!\n"
+                "• ابدأوا النقاش والأسئلة فوراً في المحادثة.\n"
+                "• عند الجاهزية، اضغطوا <b>🗳️ بدء التصويت على الجاسوس</b> أدناه."
+            ),
+        )
+        notifications: list[Notification] = [group_announcement]
+
+        for player in session.players.values():
+            if not player.active:
+                continue
+            if player.user_id == spy_uid:
+                player.is_spy = True
+                player.secret_word = None
+                notifications.append(
                     Notification(
                         channel="dm",
-                        target_id=p.user_id,
+                        target_id=player.user_id,
                         text=(
                             "🚨 <b>أنت الجاسوس الوحيد في هذه الجولة! 🕵️‍♂️</b>\n\n"
                             "❌ أنت لا تعرف الكلمة السرية للموقع!\n"
@@ -289,14 +333,14 @@ class SessionManager:
                     )
                 )
             else:
-                p.is_spy = False
-                p.secret_word = loc["word"]
-                dm_notifications.append(
+                player.is_spy = False
+                player.secret_word = loc["word"]
+                notifications.append(
                     Notification(
                         channel="dm",
-                        target_id=p.user_id,
+                        target_id=player.user_id,
                         text=(
-                            f"👥 <b>أنت مواطن شريف! (لست الجاسوس) ✅</b>\n\n"
+                            "👥 <b>أنت مواطن شريف! (لست الجاسوس) ✅</b>\n\n"
                             f"🤫 <b>الكلمة السرية للموقع هي: {loc['name']}</b>\n\n"
                             "احذر أن يكتشفك الجاسوس! اسأل أسئلة ذكية في المحادثة لاكتشاف الجاسوس دون كشف الكلمة السرية."
                         ),
@@ -304,127 +348,185 @@ class SessionManager:
                 )
 
         self._store.put(session)
-        return OperationResult(ok=True, notifications=dm_notifications, session=session)
+        self._schedule_round_timers(session)
 
-    def complete_role_dealing(self, group_chat_id: int) -> OperationResult:
-        """Transition session state from DEALING to DISCUSSION after DM distribution."""
-        session = self._store.get(group_chat_id)
-        if session is None or session.state != GameState.DEALING:
-            return OperationResult(ok=False, reason="not_in_dealing", session=session)
+        return OperationResult(ok=True, notifications=notifications, session=session)
 
-        session.state = GameState.DISCUSSION
-        buttons = self._build_discussion_buttons(session)
+    def _schedule_round_timers(self, session: GameSession) -> None:
+        """Arm the half-time reminder and the round deadline for this generation.
 
-        announcement = Notification(
-            channel="group",
-            target_id=group_chat_id,
-            text=(
-                "🕵️‍♂️ <b>تم توزيع الكلمات السرية بالخاص لجميع اللاعبين بنجاح!</b>\n\n"
-                "• هناك جاسوس واحد بينكم لا يعرف الكلمة السرية!\n"
-                "• ابدأوا النقاش والأسئلة فوراً في المحادثة.\n"
-                "• عند الجاهزية، اضغطوا 🗳️ <b>بدء التصويت على الجاسوس</b> أدناه."
+        Uses the generation-bound ``schedule`` API rather than the legacy
+        ``start(group_chat_id, ...)`` helper.  The legacy helper hardcoded
+        generation ``0``, which no real session ever has, so any deployment that
+        wired ``session_lookup`` would have had every timer silently rejected.
+
+        ``expected_revision`` is deliberately left unset: the store bumps the
+        revision on every commit, so pinning it would let an ordinary vote
+        cancel the round deadline.
+        """
+        if self._timer_service is None:
+            return
+
+        key = session.session_key
+        timeout = session.guessing_timeout_seconds
+        if timeout <= 0:
+            self._fire_timeout("expired", session.group_chat_id)
+            return
+
+        self._timer_service.schedule(
+            key,
+            "half_elapsed",
+            f"{session.game_id}-r{session.round_number}-half",
+            timeout / 2,
+            lambda event: self._fire_timeout(
+                "half_elapsed", event.session_key.group_chat_id
             ),
-            buttons=buttons,
-            edit_message_id=session.control_message_id,
+            # Skipped automatically once a ballot or the spy's guess is open,
+            # where a "hurry up and vote" nudge would be noise.
+            expected_phase=RoundPhase.DISCUSSION,
         )
-        self._store.put(session)
-        return OperationResult(ok=True, notifications=[announcement], session=session)
+        self._timer_service.schedule(
+            key,
+            "expired",
+            f"{session.game_id}-r{session.round_number}-expired",
+            timeout,
+            lambda event: self._fire_timeout(
+                "expired", event.session_key.group_chat_id
+            ),
+        )
 
-    def rollback_failed_dealing(
+    def _fire_timeout(self, kind: str, group_chat_id: int) -> None:
+        """Hand a fired timer to the injected dispatcher, or resolve inline.
+
+        Timer callbacks run synchronously in the event loop, so mutating a
+        session directly from one can interleave with a handler that is holding
+        the group lock across an ``await``.  When a dispatcher is injected the
+        work is re-entered asynchronously under that lock instead.  The inline
+        branch keeps the component usable in synchronous tests.
+        """
+        if self._timeout_dispatcher is not None:
+            self._timeout_dispatcher(kind, group_chat_id)
+            return
+        if kind == "half_elapsed":
+            self._on_half_elapsed(group_chat_id)
+        else:
+            self._on_expired(group_chat_id)
+
+    def rollback_failed_start(
         self, group_chat_id: int, failed_user_ids: list[int], bot_username: str = "guessJobot"
     ) -> OperationResult:
-        """Roll back DEALING session to LOBBY if DM role distribution fails."""
+        """Roll a GUESSING round back to LOBBY when role delivery fails.
+
+        Keeps the round unplayable: clears roles/secret, cancels timers, and
+        returns a group notification naming the failed recipients without any
+        success announcement.
+        """
         session = self._store.get(group_chat_id)
-        if session is None or session.state != GameState.DEALING:
-            return OperationResult(ok=False, reason="not_in_dealing", session=session)
+        if session is None or session.state != GameState.GUESSING:
+            return OperationResult(ok=False, reason="not_in_guessing", session=session)
+
+        if self._timer_service is not None:
+            self._timer_service.cancel(group_chat_id)
 
         for uid in failed_user_ids:
             if uid in session.players:
                 session.players[uid].dm_ready = False
 
+        for player in session.players.values():
+            player.is_spy = False
+            player.secret_word = None
+
         session.state = GameState.LOBBY
         session.spy_user_id = None
         session.secret_location_name = ""
         session.secret_location_word = ""
+        session.secret_category = ""
+        session.votes.clear()
+        session.voting_active = False
+        session.spy_guessing_active = False
 
         failed_names = ", ".join(
-            [session.players[uid].display_name for uid in failed_user_ids if uid in session.players]
+            session.players[uid].display_name
+            for uid in failed_user_ids
+            if uid in session.players
         )
-        buttons = self._build_lobby_buttons(session, bot_username)
         notif = Notification(
             channel="group",
             target_id=group_chat_id,
             text=(
-                f"❌ <b>فشل إرسال الكلمات بالخاص!</b>\n\n"
-                f"تعذر الإرسال للاعبين التالية أسماؤهم بسبب حظر البوت أو عدم تفعيل الخاص:\n"
+                "❌ <b>فشل إرسال الكلمات السرية بالخاص!</b>\n\n"
+                "تعذر الإرسال للاعبين التالية أسماؤهم بسبب حظر البوت أو عدم تفعيل الخاص:\n"
                 f"👉 <b>{failed_names}</b>\n\n"
-                f"تمت إعادة اللعبة للوبي. يرجى تفعيل الخاص مع البوت ومحاولة البدء مجدداً."
+                "تمت إعادة اللعبة للوبي. يرجى تفعيل الخاص مع البوت ومحاولة البدء مجدداً."
             ),
-            buttons=buttons,
+            buttons=[list(row) for row in LOBBY_BUTTONS],
             edit_message_id=session.control_message_id,
         )
         self._store.put(session)
-        return OperationResult(ok=True, notifications=[notif], session=session)
+        return OperationResult(ok=False, reason="role_delivery_failed", notifications=[notif], session=session)
 
-    def start_voting_panel(self, group_chat_id: int, requester_id: int) -> OperationResult:
-        """Transition DISCUSSION session to VOTING state."""
+    # ------------------------------------------------------------------
+    # Voting
+    # ------------------------------------------------------------------
+    def start_voting_panel(self, group_chat_id: int) -> OperationResult:
+        """Open the spy ballot for an active GUESSING round."""
         session = self._store.get(group_chat_id)
-        if session is None or session.state != GameState.DISCUSSION:
+        if session is None or session.state != GameState.GUESSING:
             return OperationResult(
                 ok=False,
-                reason="not_in_discussion",
+                reason="not_playing",
                 alert_text="⚠️ لا يمكنك فتح التصويت في الوقت الحالي.",
                 show_alert=True,
                 session=session,
             )
 
-        if requester_id not in session.players or not session.players[requester_id].active:
+        if session.voting_active:
             return OperationResult(
                 ok=False,
-                reason="not_active_player",
-                alert_text="⚠️ عذراً، فقط اللاعبون المشاركون يستطيعون فتح التصويت!",
+                reason="voting_already_open",
+                alert_text="⚠️ التصويت مفتوح بالفعل.",
                 show_alert=True,
                 session=session,
             )
 
-        session.state = GameState.VOTING
+        active_players = [p for p in session.players.values() if p.active]
+        if len(active_players) < MIN_PLAYERS_TO_VOTE:
+            return OperationResult(
+                ok=False,
+                reason="not_enough_players",
+                alert_text=f"⚠️ يلزم {MIN_PLAYERS_TO_VOTE} لاعبين على الأقل لفتح التصويت.",
+                show_alert=True,
+                session=session,
+            )
+
+        session.voting_active = True
         session.vote_round = 1
         session.votes.clear()
-        session.eligible_vote_targets = [p.user_id for p in session.players.values() if p.active]
+        session.eligible_vote_targets = [p.user_id for p in active_players]
 
-        buttons = self._build_voting_buttons(session)
         notif = Notification(
             channel="group",
             target_id=group_chat_id,
             text=(
-                "🗳️ <b>تم فتح باب التصويت لاكتشاف الجاسوس!</b>\n\n"
-                "اختر الشخص المشتبه به بالضغط على اسمه أدناه (لا يمكنك التصويت لنفسك):"
+                "🗳️ <b>بدأ التصويت على الجاسوس!</b>\n\n"
+                "اضغط على اسم اللاعب الذي تشك أنه الجاسوس أدناه:"
             ),
-            buttons=buttons,
+            buttons=self._build_vote_buttons(active_players),
             edit_message_id=session.control_message_id,
         )
         self._store.put(session)
         return OperationResult(ok=True, notifications=[notif], session=session)
 
     def record_spy_vote(
-        self, group_chat_id: int, voter_id: int, target_id: int, game_id: str, vote_round: int
+        self, group_chat_id: int, voter_id: int, target_id: int
     ) -> OperationResult:
-        """Record a vote, handling validation, double-voting prevention, and tie-breaking."""
+        """Record a single vote, resolving the round when every active voter has voted."""
         session = self._store.get(group_chat_id)
-        if session is None or session.state != GameState.VOTING:
+        if session is None or session.state != GameState.GUESSING or not session.voting_active:
             return OperationResult(
                 ok=False,
-                reason="not_in_voting",
+                reason="voting_not_open",
                 alert_text="⚠️ التصويت غير مفتوح حالياً.",
-                show_alert=True,
-                session=session,
-            )
-
-        if session.game_id != game_id or session.vote_round != vote_round:
-            return OperationResult(
-                ok=False,
-                reason="stale_vote_button",
-                alert_text="⚠️ انتهت صلاحية هذه اللوحة. استخدم لوحة التصويت الحالية.",
                 show_alert=True,
                 session=session,
             )
@@ -438,16 +540,7 @@ class SessionManager:
                 session=session,
             )
 
-        if voter_id == target_id:
-            return OperationResult(
-                ok=False,
-                reason="self_voting_prohibited",
-                alert_text="⚠️ لا يمكنك التصويت لنفسك!",
-                show_alert=True,
-                session=session,
-            )
-
-        if target_id not in session.eligible_vote_targets:
+        if target_id not in session.eligible_vote_targets or target_id not in session.players:
             return OperationResult(
                 ok=False,
                 reason="ineligible_target",
@@ -469,191 +562,118 @@ class SessionManager:
         active_players = [p for p in session.players.values() if p.active]
         total_active = len(active_players)
         voted_count = len(session.votes)
+        voter_name = session.players[voter_id].display_name
+
+        vote_recorded = Notification(
+            channel="group",
+            target_id=group_chat_id,
+            text=f"🗳️ قام <b>{voter_name}</b> بالتصويت! ({voted_count}/{total_active} أصوات)",
+            edit_message_id=session.control_message_id,
+        )
 
         if voted_count < total_active:
             self._store.put(session)
-            buttons = self._build_voting_buttons(session)
-            notif = Notification(
-                channel="group",
-                target_id=group_chat_id,
-                text=(
-                    f"🗳️ <b>التصويت جارٍ لاكتشاف الجاسوس!</b> (الجولة {session.vote_round})\n\n"
-                    f"📊 <b>الأصوات المسجلة حتى الآن:</b> ({voted_count}/{total_active})"
-                ),
-                buttons=buttons,
-                edit_message_id=session.control_message_id,
-            )
             return OperationResult(
                 ok=True,
                 alert_text="✅ تم تسجيل صوتك بنجاح!",
                 show_alert=True,
-                notifications=[notif],
+                notifications=[vote_recorded],
                 session=session,
             )
 
-        # Tally all votes
+        # Everyone active has voted -> tally.
         tally: dict[int, int] = {}
         for tid in session.votes.values():
             tally[tid] = tally.get(tid, 0) + 1
-
         max_votes = max(tally.values())
         top_targets = [tid for tid, count in tally.items() if count == max_votes]
 
-        # Check for Tie
         if len(top_targets) > 1:
-            session.vote_round += 1
+            # Tie: close the ballot without eliminating anyone.
+            session.voting_active = False
             session.votes.clear()
-            session.eligible_vote_targets = top_targets.copy()
+            session.eligible_vote_targets = [p.user_id for p in active_players]
             self._store.put(session)
-
-            tied_names = ", ".join([session.players[tid].display_name for tid in top_targets])
-            buttons = self._build_voting_buttons(session)
-            notif = Notification(
+            tie_notif = Notification(
                 channel="group",
                 target_id=group_chat_id,
                 text=(
-                    f"⚖️ <b>حدث تعادل في التصويت بين: ({tied_names})!</b>\n\n"
-                    f"🔄 تبدأ الآن جولة تصويت جديدة (جولة {session.vote_round}) بين المتعادلين فقط.\n"
-                    f"اصوتوا لاختيار المتهم الرئيسي:"
+                    "⚖️ <b>تعادل في التصويت!</b>\n\n"
+                    "لم يتم إقصاء أي لاعب. تابعوا النقاش وأعيدوا فتح التصويت عند الجاهزية."
                 ),
-                buttons=buttons,
                 edit_message_id=session.control_message_id,
             )
             return OperationResult(
                 ok=True,
-                alert_text="⚖️ تعادل في الأصوات! بدأت جولة إعادة تصويت.",
+                alert_text="⚖️ تعادل! لم يُقصَ أحد.",
                 show_alert=True,
-                notifications=[notif],
+                notifications=[vote_recorded, tie_notif],
                 session=session,
             )
 
-        # Single accused target
         accused_id = top_targets[0]
-        accused_p = session.players.get(accused_id)
-        accused_name = accused_p.display_name if accused_p else "لاعب"
+        accused_name = session.players[accused_id].display_name
+        session.voting_active = False
 
         if accused_id == session.spy_user_id:
-            session.state = GameState.SPY_LAST_GUESS
-            loc_entry: LocationEntry = {
-                "name": session.secret_location_name,
-                "word": session.secret_location_word,
-                "category": session.secret_category,
-            }
-            options = get_location_options(loc_entry, count=4)
-            session.spy_guess_options = [opt["word"] for opt in options]
-
-            buttons = self._build_spy_last_guess_buttons(session, options)
+            # Spy exposed: grant the single final guess opportunity.
+            session.spy_guessing_active = True
+            session.spy_guess_attempted = False
             self._store.put(session)
-            notif = Notification(
+            caught_notif = Notification(
                 channel="group",
                 target_id=group_chat_id,
                 text=(
-                    f"🎉 <b>أحسنتم! تم كشف الجاسوس الحقيقي وهو: {accused_name}! 🕵️‍♂️</b>\n\n"
-                    f"💡 <b>الفرصة الأخيرة للجاسوس {accused_name}:</b>\n"
-                    f"لديك محاولة واحدة فقط لتخمين المكان السري من الأزرار أدناه للفوز والهروب!"
+                    f"🎯 <b>تم كشف الجاسوس: {accused_name}! 🕵️‍♂️</b>\n\n"
+                    "💡 لديه فرصة أخيرة لتخمين الكلمة السرية للفوز."
                 ),
-                buttons=buttons,
+                buttons=[[{"text": "💡 تخمين الكلمة السرية (الجاسوس)", "callback_data": "spy_guess_menu"}]],
                 edit_message_id=session.control_message_id,
             )
             return OperationResult(
                 ok=True,
-                alert_text="🎉 تم كشف الجاسوس! بدأت فرصة التخمين الأخيرة.",
+                alert_text="🎯 تم كشف الجاسوس!",
                 show_alert=True,
-                notifications=[notif],
-                session=session,
-            )
-        else:
-            session.state = GameState.COMPLETED
-            spy_p = session.players.get(session.spy_user_id)
-            spy_name = spy_p.display_name if spy_p else "الجاسوس"
-            self._store.put(session)
-
-            buttons = [[{"text": "🎮 لعبة جديدة", "callback_data": f"sg:{session.game_id}:r{session.round_number}:newgame"}]]
-            notif = Notification(
-                channel="group",
-                target_id=group_chat_id,
-                text=(
-                    f"❌ <b>للأسف! تم طرد مواطن بريء وهو: {accused_name}! 👥</b>\n\n"
-                    f"🕵️‍♂️ <b>الجاسوس الحقيقي كان: {spy_name}!</b>\n"
-                    f"🤫 المكان السري كان: <b>{session.secret_location_name}</b>\n\n"
-                    f"🏆 <b>فاز الجاسوس {spy_name} بالتمويه والخدع! 🎉</b>"
-                ),
-                buttons=buttons,
-                edit_message_id=session.control_message_id,
-            )
-            return OperationResult(
-                ok=True,
-                alert_text="❌ تم طرد مواطن بريء! فاز الجاسوس.",
-                show_alert=True,
-                notifications=[notif],
+                notifications=[vote_recorded, caught_notif],
                 session=session,
             )
 
-    def handle_spy_guess_menu(self, group_chat_id: int, user_id: int, game_id: str) -> OperationResult:
-        """Handle tap on Spy Guess Menu button during DISCUSSION state."""
-        session = self._store.get(group_chat_id)
-        if session is None or session.state not in (GameState.DISCUSSION, GameState.SPY_LAST_GUESS):
-            return OperationResult(
-                ok=False,
-                reason="invalid_state",
-                alert_text="⚠️ زر التخمين غير متاح حالياً.",
-                show_alert=True,
-                session=session,
-            )
-
-        if session.game_id != game_id:
-            return OperationResult(
-                ok=False,
-                reason="stale_game_id",
-                alert_text="⚠️ انتهت صلاحية هذه اللوحة.",
-                show_alert=True,
-                session=session,
-            )
-
-        if user_id != session.spy_user_id:
-            return OperationResult(
-                ok=False,
-                reason="not_spy",
-                alert_text="⚠️ عذراً، هذا الزر مخصص للجاسوس الحقيقي فقط! 🕵️‍♂️",
-                show_alert=True,
-                session=session,
-            )
-
-        session.state = GameState.SPY_LAST_GUESS
-        loc_entry: LocationEntry = {
-            "name": session.secret_location_name,
-            "word": session.secret_location_word,
-            "category": session.secret_category,
-        }
-        options = get_location_options(loc_entry, count=4)
-        session.spy_guess_options = [opt["word"] for opt in options]
-
-        buttons = self._build_spy_last_guess_buttons(session, options)
+        # Innocent accused -> spy wins.
+        spy_player = session.players.get(session.spy_user_id)
+        spy_name = spy_player.display_name if spy_player else "الجاسوس"
+        secret_name = session.secret_location_name
+        session.state = GameState.COMPLETED
+        if self._timer_service is not None:
+            self._timer_service.cancel(group_chat_id)
         self._store.put(session)
-        notif = Notification(
+        win_notif = Notification(
             channel="group",
             target_id=group_chat_id,
             text=(
-                f"💡 <b>الجاسوس يرفع التحدي بالتخمين المباشر! 🕵️‍♂️</b>\n\n"
-                f"اختر المكان الصحيح من الأزرار أدناه (محاولة واحدة فقط):"
+                "🎉 <b>فاز الجاسوس! 🕵️🏆</b>\n\n"
+                f"قام الجميع بطرد خاطئ لـ <b>{accused_name}</b>!\n"
+                f"بينما الجاسوس الحقيقي <b>{spy_name}</b> نجح بالتمويه والمكر وخدع الجميع!\n"
+                f"📍 المكان السري كان: <b>{secret_name}</b>"
             ),
-            buttons=buttons,
             edit_message_id=session.control_message_id,
         )
         return OperationResult(
             ok=True,
-            alert_text="💡 اختر المكان الصحيح من الأزرار!",
+            alert_text="🎉 فاز الجاسوس!",
             show_alert=True,
-            notifications=[notif],
+            notifications=[vote_recorded, win_notif],
             session=session,
         )
 
+    # ------------------------------------------------------------------
+    # Spy final guess
+    # ------------------------------------------------------------------
     def submit_spy_location_guess(
-        self, group_chat_id: int, spy_id: int, option_index: int, game_id: str
+        self, group_chat_id: int, actor_id: int, word: str
     ) -> OperationResult:
-        """Submit the single allowed Spy location guess by index."""
+        """Submit the spy's single allowed location guess by word."""
         session = self._store.get(group_chat_id)
-        if session is None or session.state != GameState.SPY_LAST_GUESS:
+        if session is None or not session.spy_guessing_active:
             return OperationResult(
                 ok=False,
                 reason="not_in_spy_guess",
@@ -662,16 +682,7 @@ class SessionManager:
                 session=session,
             )
 
-        if session.game_id != game_id:
-            return OperationResult(
-                ok=False,
-                reason="stale_game_id",
-                alert_text="⚠️ انتهت صلاحية هذه اللوحة.",
-                show_alert=True,
-                session=session,
-            )
-
-        if spy_id != session.spy_user_id:
+        if actor_id != session.spy_user_id:
             return OperationResult(
                 ok=False,
                 reason="not_spy",
@@ -690,64 +701,50 @@ class SessionManager:
             )
 
         session.spy_guess_attempted = True
+        session.spy_guessing_active = False
         session.state = GameState.COMPLETED
+        if self._timer_service is not None:
+            self._timer_service.cancel(group_chat_id)
 
-        if option_index < 0 or option_index >= len(session.spy_guess_options):
-            word_guess = ""
-        else:
-            word_guess = session.spy_guess_options[option_index]
+        spy_player = session.players.get(session.spy_user_id)
+        spy_name = spy_player.display_name if spy_player else "الجاسوس"
+        secret_word = session.secret_location_word or ""
+        secret_name = session.secret_location_name
+        correct = bool(word) and word.strip().lower() == secret_word.strip().lower()
 
-        spy_p = session.players.get(spy_id)
-        spy_name = spy_p.display_name if spy_p else "الجاسوس"
-        buttons = [[{"text": "🎮 لعبة جديدة", "callback_data": f"sg:{session.game_id}:r{session.round_number}:newgame"}]]
-
-        if word_guess and word_guess.strip().lower() == session.secret_location_word.lower():
-            notif = Notification(
-                channel="group",
-                target_id=group_chat_id,
-                text=(
-                    f"🎉 <b>تخمين عبقري من الجاسوس! 🕵️‍♂️🏆</b>\n\n"
-                    f"عرف الجاسوس <b>{spy_name}</b> المكان السري الصحيح وهو: <b>{session.secret_location_name}</b> وقام بالهروب وفاز بالجولة!"
-                ),
-                buttons=buttons,
-                edit_message_id=session.control_message_id,
+        if correct:
+            text = (
+                "🎉 <b>تخمين عبقري من الجاسوس! 🕵️‍♂️🏆</b>\n\n"
+                f"عرف الجاسوس <b>{spy_name}</b> المكان السري الصحيح وهو: <b>{secret_name}</b> وفاز بالجولة!"
             )
         else:
-            notif = Notification(
-                channel="group",
-                target_id=group_chat_id,
-                text=(
-                    f"❌ <b>تخمين خاطئ من الجاسوس! 🕵️‍♂️</b>\n\n"
-                    f"حاول الجاسوس {spy_name} التخمين لكن الإجابة كانت خاطئة!\n"
-                    f"🤫 المكان السري الحقيقي كان: <b>{session.secret_location_name}</b>\n\n"
-                    f"🏆 <b>فاز المواطنون الشرفاء بالجولة! 👥🎉</b>"
-                ),
-                buttons=buttons,
-                edit_message_id=session.control_message_id,
+            text = (
+                "❌ <b>تخمين خاطئ من الجاسوس! 🕵️‍♂️</b>\n\n"
+                f"حاول الجاسوس {spy_name} التخمين لكن الإجابة كانت خاطئة!\n"
+                f"🤫 المكان السري الحقيقي كان: <b>{secret_name}</b>\n\n"
+                "🏆 <b>فاز المواطنون الشرفاء بالجولة! 👥🎉</b>"
             )
 
         self._store.put(session)
+        notif = Notification(
+            channel="group",
+            target_id=group_chat_id,
+            text=text,
+            edit_message_id=session.control_message_id,
+        )
         return OperationResult(ok=True, notifications=[notif], session=session)
 
-    def cancel_session(
-        self, group_chat_id: int, user_id: int, game_id: str
-    ) -> OperationResult:
-        """Cancel an active session (Host-only)."""
+    # ------------------------------------------------------------------
+    # Cancellation
+    # ------------------------------------------------------------------
+    def cancel_session(self, group_chat_id: int, user_id: int) -> OperationResult:
+        """Cancel an active session (Host-only) and scrub its resources."""
         session = self._store.get(group_chat_id)
         if session is None or session.state not in _NON_TERMINAL_STATES:
             return OperationResult(
                 ok=False,
                 reason="no_active_session",
                 alert_text="⚠️ لا توجد لعبة نشطة لإلغائها.",
-                show_alert=True,
-                session=session,
-            )
-
-        if session.game_id != game_id:
-            return OperationResult(
-                ok=False,
-                reason="stale_game_id",
-                alert_text="⚠️ انتهت صلاحية هذه اللوحة.",
                 show_alert=True,
                 session=session,
             )
@@ -761,84 +758,208 @@ class SessionManager:
                 session=session,
             )
 
-        host_p = session.players.get(user_id)
-        host_name = host_p.display_name if host_p else "منشئ اللعبة"
-        session.state = GameState.CANCELLED
+        if self._timer_service is not None:
+            self._timer_service.cancel(group_chat_id)
 
-        buttons = [[{"text": "🎮 لعبة جديدة", "callback_data": f"sg:{session.game_id}:r{session.round_number}:newgame"}]]
+        host_name = session.players[session.host_id].display_name
+        self._scrub_terminal(session, GameState.CANCELLED)
+        self._store.put(session)
+
         notif = Notification(
             channel="group",
             target_id=group_chat_id,
             text=f"❌ قام <b>{host_name}</b> بإلغاء اللعبة.",
-            buttons=buttons,
+        )
+        return OperationResult(ok=True, notifications=[notif], session=session)
+
+    # ------------------------------------------------------------------
+    # Timeout / reveal
+    # ------------------------------------------------------------------
+    def half_time_reminder(self, group_chat_id: int) -> OperationResult:
+        """Build the half-time nudge without mutating the session."""
+        session = self._store.get(group_chat_id)
+        if session is None or session.state != GameState.GUESSING:
+            return OperationResult(ok=False, reason="not_in_guessing", session=session)
+        notif = Notification(
+            channel="group",
+            target_id=group_chat_id,
+            text="⏳ <b>تذكير: نصف الوقت مضى!</b> سارعوا بالنقاش والتصويت.",
+        )
+        return OperationResult(ok=True, notifications=[notif], session=session)
+
+    def _on_half_elapsed(self, group_chat_id: int) -> OperationResult:
+        res = self.half_time_reminder(group_chat_id)
+        if res.ok and self._on_notification_cb is not None:
+            self._on_notification_cb(res.notifications)
+        return res
+
+    def _on_expired(self, group_chat_id: int) -> OperationResult:
+        res = self.enter_reveal(group_chat_id)
+        if res.ok and self._on_notification_cb is not None:
+            self._on_notification_cb(res.notifications)
+        return res
+
+    def enter_reveal(self, group_chat_id: int) -> OperationResult:
+        """Resolve a GUESSING round whose discussion timer expired.
+
+        Nobody exposed the spy before the deadline, so the spy takes the round.
+        The spy's identity and the secret location are disclosed before the
+        session is scrubbed, because scrubbing clears both.
+        """
+        session = self._store.get(group_chat_id)
+        if session is None or session.state != GameState.GUESSING:
+            return OperationResult(ok=False, reason="not_in_guessing", session=session)
+
+        session.state = GameState.REVEAL
+
+        spy_player = (
+            session.players.get(session.spy_user_id)
+            if session.spy_user_id is not None
+            else None
+        )
+        spy_name = spy_player.display_name if spy_player is not None else "الجاسوس"
+        secret_name = session.secret_location_name or "غير معروف"
+
+        if self._timer_service is not None:
+            self._timer_service.cancel(group_chat_id)
+
+        notif = Notification(
+            channel="group",
+            target_id=group_chat_id,
+            text=(
+                "⏰ <b>انتهى الوقت ولم يُكشف الجاسوس!</b>\n\n"
+                f"🕵️ الجاسوس كان: <b>{spy_name}</b>\n"
+                f"📍 المكان السري كان: <b>{secret_name}</b>\n\n"
+                "🏆 <b>فاز الجاسوس بالجولة! 🕵️🎉</b>"
+            ),
             edit_message_id=session.control_message_id,
         )
+
+        self._scrub_terminal(session, GameState.COMPLETED)
         self._store.put(session)
         return OperationResult(ok=True, notifications=[notif], session=session)
 
-    # Button Builders
-    def _build_lobby_buttons(self, session: GameSession, bot_username: str) -> list[list[dict[str, str]]]:
-        gid = session.game_id
-        r = f"r{session.round_number}"
-        return [
-            [{"text": "💬 1. تفعيل الخاص مع البوت (اضغط هنا أولاً)", "url": f"https://t.me/{bot_username}"}],
-            [
-                {"text": "➕ 2. انضمام للعبة", "callback_data": f"sg:{gid}:{r}:join"},
-                {"text": "🚪 مغادرة", "callback_data": f"sg:{gid}:{r}:leave"},
-            ],
-            [
-                {"text": "🚀 3. بدء اللعبة", "callback_data": f"sg:{gid}:{r}:start"},
-                {"text": "❌ إلغاء اللعبة", "callback_data": f"sg:{gid}:{r}:cancel"},
-            ],
-            [{"text": "📌 أظهر لوحة الأزرار بالأسفل", "callback_data": f"sg:{gid}:{r}:ref"}],
-        ]
+    # ------------------------------------------------------------------
+    # Spy final-guess menu
+    # ------------------------------------------------------------------
+    def build_spy_guess_menu(self, group_chat_id: int, actor_id: int) -> OperationResult:
+        """Offer the exposed spy a fixed multiple-choice ballot of locations.
 
-    def _build_discussion_buttons(self, session: GameSession) -> list[list[dict[str, str]]]:
-        gid = session.game_id
-        r = f"r{session.round_number}"
-        return [
-            [{"text": "🗳️ بدء التصويت على الجاسوس", "callback_data": f"sg:{gid}:{r}:openvote"}],
-            [{"text": "💡 تخمين الكلمة السرية (للجاسوس)", "callback_data": f"sg:{gid}:{r}:spymenu"}],
-            [{"text": "📌 أظهر لوحة الأزرار بالأسفل", "callback_data": f"sg:{gid}:{r}:ref"}],
-        ]
+        The option list is generated once per round and then reused, so the spy
+        cannot reroll for an easier set of distractors by reopening the menu.
+        """
+        session = self._store.get(group_chat_id)
+        if session is None or not session.spy_guessing_active:
+            return OperationResult(
+                ok=False,
+                reason="not_in_spy_guess",
+                alert_text="⚠️ التخمين غير متاح حالياً.",
+                show_alert=True,
+                session=session,
+            )
 
-    def _build_voting_buttons(self, session: GameSession) -> list[list[dict[str, str]]]:
-        gid = session.game_id
-        r = f"r{session.round_number}"
-        vr = f"v{session.vote_round}"
+        if actor_id != session.spy_user_id:
+            return OperationResult(
+                ok=False,
+                reason="not_spy",
+                alert_text="⚠️ عذراً، التخمين مخصص للجاسوس فقط!",
+                show_alert=True,
+                session=session,
+            )
+
+        if session.spy_guess_attempted:
+            return OperationResult(
+                ok=False,
+                reason="already_attempted",
+                alert_text="⚠️ تمت محاولة التخمين مسبقاً!",
+                show_alert=True,
+                session=session,
+            )
+
+        if not session.spy_guess_options:
+            secret_entry: LocationEntry = {
+                "name": session.secret_location_name or "",
+                "word": session.secret_location_word or "",
+                "category": session.secret_category,
+            }
+            options = get_location_options(secret_entry, SPY_GUESS_OPTION_COUNT)
+            session.spy_guess_options = [option["word"] for option in options]
+            session.spy_guess_labels = [option["name"] for option in options]
+            self._store.put(session)
 
         buttons: list[list[dict[str, str]]] = []
-        eligible_players = [
-            p for p in session.players.values()
-            if p.active and p.user_id in session.eligible_vote_targets
-        ]
-
         row: list[dict[str, str]] = []
-        for p in eligible_players:
-            row.append({"text": f"👤 {p.display_name}", "callback_data": f"sg:{gid}:{r}:{vr}:vote:{p.user_id}"})
+        for index, label in enumerate(session.spy_guess_labels):
+            row.append({"text": label, "callback_data": f"spy_guess:{index}"})
             if len(row) == 2:
                 buttons.append(row)
                 row = []
         if row:
             buttons.append(row)
 
-        buttons.append([{"text": "📌 أظهر لوحة الأزرار بالأسفل", "callback_data": f"sg:{gid}:{r}:ref"}])
-        return buttons
+        notif = Notification(
+            channel="group",
+            target_id=group_chat_id,
+            text=(
+                "💡 <b>فرصة الجاسوس الأخيرة!</b>\n\n"
+                "على الجاسوس اختيار المكان السري الصحيح من الخيارات أدناه.\n"
+                "<b>محاولة واحدة فقط — لا تراجع.</b>"
+            ),
+            buttons=buttons,
+        )
+        return OperationResult(ok=True, notifications=[notif], session=session)
 
-    def _build_spy_last_guess_buttons(
-        self, session: GameSession, options: list[LocationEntry]
-    ) -> list[list[dict[str, str]]]:
-        gid = session.game_id
-        r = f"r{session.round_number}"
+    def resolve_spy_guess_option(self, group_chat_id: int, option_index: int) -> str | None:
+        """Map a menu button index back to its secret word, or ``None``."""
+        session = self._store.get(group_chat_id)
+        if session is None:
+            return None
+        if not 0 <= option_index < len(session.spy_guess_options):
+            return None
+        return session.spy_guess_options[option_index]
 
+    # ------------------------------------------------------------------
+    # Panel / helpers
+    # ------------------------------------------------------------------
+    def build_status_panel_notification(self, group_chat_id: int, header: str) -> Notification:
+        """Build the current control panel notification for a group."""
+        session = self._store.get(group_chat_id)
+        body = (
+            "🕵️ <b>لوحة التحكم للجولة النشطة:</b>\n"
+            "الأسئلة مستمرة في المجموعة! عند الجاهزية اضغط زر التصويت أدناه."
+        )
+        return Notification(
+            channel="group",
+            target_id=group_chat_id,
+            text=f"{header}\n\n{body}",
+            buttons=[list(row) for row in ACTIVE_PANEL_BUTTONS],
+            edit_message_id=session.control_message_id if session else None,
+        )
+
+    def _build_vote_buttons(self, active_players: list[Player]) -> list[list[dict[str, str]]]:
         buttons: list[list[dict[str, str]]] = []
         row: list[dict[str, str]] = []
-        for idx, opt in enumerate(options):
-            row.append({"text": opt["name"], "callback_data": f"sg:{gid}:{r}:spyopt:{idx}"})
+        for player in active_players:
+            row.append({"text": f"👤 {player.display_name}", "callback_data": f"vote:{player.user_id}"})
             if len(row) == 2:
                 buttons.append(row)
                 row = []
         if row:
             buttons.append(row)
-
         return buttons
+
+    def _scrub_terminal(self, session: GameSession, terminal_state: GameState) -> None:
+        """Mark a session terminal and erase every round secret it still holds."""
+        session.state = terminal_state
+        session.voting_active = False
+        session.spy_guessing_active = False
+        session.votes.clear()
+        session.eligible_vote_targets = []
+        session.spy_guess_options = []
+        session.spy_guess_labels = []
+        session.secret_location_word = None
+        session.secret_location_name = None
+        session.secret_category = ""
+        for player in session.players.values():
+            player.is_spy = False
+            player.secret_word = None

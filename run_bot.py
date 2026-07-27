@@ -1,329 +1,365 @@
-"""Telegram Bot API long-polling runner with HTTP retry and callback codec parsing."""
+#!/usr/bin/env python3
+"""Entry point for the Telegram Spy Game bot (لعبة الجاسوس والكلمة السرية).
+
+Runs long polling against the Bot API with no third-party dependencies, plus a
+tiny HTTP health endpoint so the process can be hosted as a Render Web Service
+(Render terminates any web service that never binds ``$PORT``).
+
+Configuration (environment variables):
+    BOT_TOKEN   required. Bot token from @BotFather.
+    PORT        optional. Health-check port; Render injects this.
+    ROUND_SECONDS
+                optional. Discussion length in seconds (default 300).
+    LOG_LEVEL   optional. Python log level name (default INFO).
+"""
+
+from __future__ import annotations
 
 import asyncio
-import html
+import contextlib
+import logging
 import os
+import signal
 import sys
-import httpx
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, Coroutine
+
+from photo_guess_game.session_manager import SessionManager
 from photo_guess_game.session_store import SessionStore
 from photo_guess_game.telegram_adapter import TelegramAdapter
+from photo_guess_game.telegram_api import (
+    DEFAULT_BASE_URL,
+    LONG_POLL_SECONDS,
+    TelegramAPI,
+)
+from photo_guess_game.timer_service import TimerService
 
-BOT_TOKEN = os.environ.get(
-    "TELEGRAM_BOT_TOKEN", "8879242865:AAEEiKyKaonVIeHu5EOqb-D6xYasYIZQEE4"
+logger = logging.getLogger("spygame")
+
+HELP_TEXT = (
+    "🕵️ <b>لعبة الجاسوس والكلمة السرية</b>\n\n"
+    "<b>الأوامر:</b>\n"
+    "/newgame — فتح لوبي لعبة جديدة في المجموعة\n"
+    "/cancel — إلغاء اللعبة الحالية (المنشئ فقط)\n"
+    "/help — عرض هذه الرسالة\n\n"
+    "<b>كيف تلعبون:</b>\n"
+    "1️⃣ أضف البوت لمجموعة وأرسل /newgame\n"
+    "2️⃣ كل لاعب يضغط <b>➕ انضمام للعبة</b>\n"
+    "3️⃣ <b>مهم:</b> كل لاعب يجب أن يبدأ محادثة خاصة مع البوت أولاً، "
+    "وإلا تعذّر إرسال الكلمة السرية له وستُلغى الجولة\n"
+    "4️⃣ المنشئ يضغط <b>🚀 بدء اللعبة</b>"
 )
 
-HELP_GUIDE_HTML = """<b>🕵️‍♂️ دليل لعبة الجاسوس والكلمة السرية (Telegram Spy Game) 💬</b>
-
-<blockquote expandable>
-<b>💡 فكرة اللعبة:</b>
-لعبة ذكاء وتمويه جماعية ممتعة! يرسل البوت موقعاً سرياً واحداً بالخاص لجميع المواطنين (مثل: 🏥 مستشفى / ✈️ مطار / 🍕 مطعم)، ولكنه يختار <b>لاعباً واحداً ليكون الجاسوس 🕵️</b> (لا يعرف الكلمة السرية!).
-
-<b>🎯 الأهداف وظروف الفوز:</b>
-• 👥 <b>المواطنون:</b> طرح أسئلة ذكية في المحادثة لكشف الجاسوس وطرد بالتصويت قبل أن يعرف الكلمة السرية!
-• 🕵️ <b>الجاسوس:</b> التظاهر بأنك تعرف الكلمة السرية، الاستماع لأسئلة المنافسين بذكاء لاكتشاف المكان السري، أو إقناع الجميع بطرد مواطن بريء!
-
-<b>📋 خطوات اللعب:</b>
-1️⃣ أرسل <code>/newgame</code> واضغط <b>➕ انضمام للعبة</b> في المجموعة.
-2️⃣ يرسل البوت الكلمة السرية بالخاص لجميع المواطنين (ويرسل للجاسوس تنبيه أنه هو الجاسوس).
-3️⃣ تبدأ الأسئلة والتحقيق المباشر في المجموعة (مثال: "هل تزور هذا المكان بالليل؟").
-4️⃣ اضغط <b>🗳️ بدء التصويت على الجاسوس</b> واصوت على المشتبه به بضغطة زر واحدة!
-5️⃣ إذا تم طرد الجاسوس، يحصل الجاسوس على فرصة أخيرة لتخمين المكان والفوز!
-</blockquote>"""
+PRIVATE_WELCOME = (
+    "✅ <b>تم تفعيل المحادثة الخاصة!</b>\n\n"
+    "أصبح بإمكاني إرسال كلمتك السرية هنا عند بدء أي جولة.\n"
+    "الآن ارجع إلى المجموعة وانضم للعبة. 🕵️"
+)
 
 
-class TelegramBotRunner:
-    """Asyncio runner managing Telegram long polling and callback dispatch."""
+# ----------------------------------------------------------------------
+# Health endpoint
+# ----------------------------------------------------------------------
+class _HealthHandler(BaseHTTPRequestHandler):
+    """Answers Render's health probe and nothing else."""
 
-    def __init__(self) -> None:
-        self.base_url = f"https://api.telegram.org/bot{BOT_TOKEN}"
-        self.store = SessionStore()
-        self.bot_username = "guessJobot"
-        self.adapter = TelegramAdapter(
-            store=self.store,
-            send_message_fn=self.send_message,
-            edit_message_fn=self.edit_message_text,
-            edit_markup_fn=self.edit_message_reply_markup,
-            bot_username=self.bot_username,
+    def do_GET(self) -> None:  # noqa: N802 - stdlib naming
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"spy game bot: polling\n")
+
+    def log_message(self, *_args: Any) -> None:
+        """Silence the default per-request stderr logging."""
+
+
+def start_health_server(port: int) -> ThreadingHTTPServer:
+    """Serve the health endpoint from a daemon thread."""
+    server = ThreadingHTTPServer(("0.0.0.0", port), _HealthHandler)
+    threading.Thread(
+        target=server.serve_forever, name="health", daemon=True
+    ).start()
+    logger.info("health endpoint listening on port %d", port)
+    return server
+
+
+# ----------------------------------------------------------------------
+# Update routing
+# ----------------------------------------------------------------------
+class BotRunner:
+    """Wires the game components to the Bot API and pumps the update loop."""
+
+    def __init__(
+        self, api: TelegramAPI, *, round_seconds: int, bot_username: str
+    ) -> None:
+        self._api = api
+        self._store = SessionStore()
+        self._stopping = asyncio.Event()
+        # Strong references to fire-and-forget tasks; without this the event
+        # loop is free to garbage-collect a task mid-flight.
+        self._background: set[asyncio.Task[Any]] = set()
+
+        loop = asyncio.get_running_loop()
+        self._timers = TimerService(
+            scheduler=lambda delay, callback: loop.call_later(delay, callback),
+            session_lookup=lambda key: self._store.get(key.group_chat_id),
         )
-        self.client: httpx.AsyncClient | None = None
+        self._manager = SessionManager(
+            self._store,
+            timer_service=self._timers,
+            timeout_dispatcher=self._on_timer_fired,
+            round_seconds=round_seconds,
+        )
+        self._adapter = TelegramAdapter(
+            self._store,
+            session_manager=self._manager,
+            timer_service=self._timers,
+            send_message_fn=api.send_message,
+            edit_message_fn=api.edit_message_text,
+            edit_markup_fn=api.edit_message_reply_markup,
+            bot_username=bot_username,
+        )
+        self._offset: int | None = None
 
-    async def send_message(
-        self, target_id: int, text: str, reply_markup: dict | None = None, parse_mode: str = "HTML"
-    ) -> dict:
-        if self.client is None:
-            return {}
-        payload: dict = {"chat_id": target_id, "text": text, "parse_mode": parse_mode}
-        if reply_markup:
-            payload["reply_markup"] = reply_markup
+    # -- task plumbing -------------------------------------------------
+    def _spawn(self, coro: Coroutine[Any, Any, Any]) -> None:
+        task = asyncio.create_task(coro)
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
 
-        for attempt in range(3):
-            try:
-                res = await self.client.post(
-                    f"{self.base_url}/sendMessage", json=payload, timeout=10.0
-                )
-                if res.status_code == 429:
-                    retry_after = res.json().get("parameters", {}).get("retry_after", 2)
-                    await asyncio.sleep(retry_after)
-                    continue
-                res.raise_for_status()
-                data = res.json()
-                if data.get("ok"):
-                    return data.get("result", {})
-                raise RuntimeError(f"Telegram API error: {data.get('description')}")
-            except (httpx.HTTPError, RuntimeError) as err:
-                if attempt == 2:
-                    raise err
-                await asyncio.sleep(1.0)
-        return {}
+    def _on_timer_fired(self, kind: str, group_chat_id: int) -> None:
+        """Bridge a synchronous timer callback into a lock-guarded coroutine."""
+        self._spawn(self._resolve_timeout(kind, group_chat_id))
 
-    async def edit_message_text(
-        self, target_id: int, message_id: int, text: str, reply_markup: dict | None = None, parse_mode: str = "HTML"
-    ) -> dict:
-        if self.client is None:
-            return {}
-        payload: dict = {
-            "chat_id": target_id,
-            "message_id": message_id,
-            "text": text,
-            "parse_mode": parse_mode,
-        }
-        if reply_markup:
-            payload["reply_markup"] = reply_markup
-
-        for attempt in range(3):
-            try:
-                res = await self.client.post(
-                    f"{self.base_url}/editMessageText", json=payload, timeout=10.0
-                )
-                if res.status_code == 429:
-                    retry_after = res.json().get("parameters", {}).get("retry_after", 2)
-                    await asyncio.sleep(retry_after)
-                    continue
-                res.raise_for_status()
-                data = res.json()
-                if data.get("ok"):
-                    return data.get("result", {})
-                return {}
-            except (httpx.HTTPError, RuntimeError) as err:
-                if attempt == 2:
-                    raise err
-                await asyncio.sleep(1.0)
-        return {}
-
-    async def edit_message_reply_markup(
-        self, target_id: int, message_id: int, reply_markup: dict | None = None
-    ) -> None:
-        if self.client is None:
-            return
-        payload: dict = {"chat_id": target_id, "message_id": message_id}
-        if reply_markup:
-            payload["reply_markup"] = reply_markup
-        try:
-            res = await self.client.post(
-                f"{self.base_url}/editMessageReplyMarkup", json=payload, timeout=10.0
-            )
-            res.raise_for_status()
-        except Exception:
-            pass
-
-    async def answer_callback_query(
-        self, callback_query_id: str, text: str = "", show_alert: bool = False
-    ) -> None:
-        if self.client is None:
-            return
-        try:
-            payload = {
-                "callback_query_id": callback_query_id,
-                "text": text,
-                "show_alert": show_alert,
-            }
-            res = await self.client.post(
-                f"{self.base_url}/answerCallbackQuery", json=payload, timeout=10.0
-            )
-            res.raise_for_status()
-        except Exception as err:
-            print(f"[Error callback query]: {err}", file=sys.stderr)
-
-    async def process_update(self, update: dict) -> None:
-        """Process a single Telegram Update."""
-        # Handle Callback Queries (Inline Keyboard Buttons)
-        callback = update.get("callback_query")
-        if callback:
-            cb_id = callback.get("id", "")
-            from_user = callback.get("from", {})
-            user_id = from_user.get("id")
-            display_name = (from_user.get("first_name", "") or "").strip() or f"User {user_id}"
-            message = callback.get("message", {})
-            chat_id = message.get("chat", {}).get("id")
-            data = callback.get("data", "")
-
-            if not chat_id or not user_id or not cb_id:
-                return
-
-            # Short Callback Codec Parsing: sg:{gid}:{round}:{action}
-            parts = data.split(":")
-            if len(parts) < 4 or parts[0] != "sg":
-                await self.answer_callback_query(
-                    cb_id, text="⚠️ زر قديم أو غير معروف.", show_alert=True
-                )
-                return
-
-            game_id = parts[1]
-            round_str = parts[2]
-            action = parts[3]
-
-            res = None
-
-            if action == "join":
-                res = await self.adapter.handle_join(chat_id, user_id, display_name)
-            elif action == "leave":
-                res = await self.adapter.handle_leave(chat_id, user_id)
-            elif action == "start":
-                res = await self.adapter.handle_startgame(chat_id, user_id)
-            elif action == "cancel":
-                res = await self.adapter.handle_cancelgame(chat_id, user_id, game_id)
-            elif action == "openvote":
-                res = await self.adapter.handle_start_voting(chat_id, user_id)
-            elif action == "spymenu":
-                res = await self.adapter.handle_spy_guess_menu(chat_id, user_id, game_id)
-            elif action == "ref":
-                res = await self.adapter.handle_refresh_panel(chat_id)
-            elif action == "newgame":
-                res = await self.adapter.handle_newgame(chat_id, user_id, display_name)
-            elif len(parts) >= 6 and parts[4] == "vote":
-                # sg:{gid}:{r}:{vr}:vote:{target_id}
-                try:
-                    vote_round = int(parts[3].replace("v", "")) if parts[3].startswith("v") else 1
-                    target_id = int(parts[5])
-                    res = await self.adapter.handle_spy_vote(
-                        chat_id, voter_id=user_id, target_id=target_id, game_id=game_id, vote_round=vote_round
-                    )
-                except ValueError:
-                    pass
-            elif action == "spyopt" and len(parts) >= 5:
-                # sg:{gid}:{r}:spyopt:{option_index}
-                try:
-                    option_index = int(parts[4])
-                    res = await self.adapter.handle_spy_guess(
-                        chat_id, spy_id=user_id, option_index=option_index, game_id=game_id
-                    )
-                except ValueError:
-                    pass
-
-            # Always answer callback query immediately!
-            if res is not None:
-                toast_text = res.alert_text or ("✅ تم!" if res.ok else "⚠️ تعذر التنفيذ.")
-                await self.answer_callback_query(cb_id, text=toast_text, show_alert=res.show_alert)
+    async def _resolve_timeout(self, kind: str, group_chat_id: int) -> None:
+        async with self._store.lock_for(group_chat_id):
+            if kind == "half_elapsed":
+                res = self._manager.half_time_reminder(group_chat_id)
             else:
-                await self.answer_callback_query(cb_id, text="⚠️ انتهت صلاحية هذا الزر.", show_alert=True)
-            return
+                res = self._manager.enter_reveal(group_chat_id)
+        if res.ok and res.notifications:
+            await self._adapter.dispatch_notifications(res.notifications)
 
-        # Handle Group MyChatMember (Bot added to group -> Send Launcher)
-        my_chat_member = update.get("my_chat_member")
-        if my_chat_member:
-            chat = my_chat_member.get("chat", {})
-            chat_id = chat.get("id")
-            new_status = my_chat_member.get("new_chat_member", {}).get("status")
-            if chat_id and new_status in ("member", "administrator"):
-                launcher_buttons = [
-                    [{"text": "🎮 إنشاء لعبة جديدة", "callback_data": f"sg:launcher:r1:newgame"}],
-                    [{"text": "💬 تفعيل الخاص مع البوت", "url": f"https://t.me/{self.bot_username}"}],
-                ]
-                await self.send_message(
-                    chat_id,
-                    "👋 <b>أهلاً بكم! أنا بوت لعبة الجاسوس والكلمة السرية!</b> 🕵️‍♂️\n\nاضغطوا الزر أدناه لبدء لعبة جديدة ممتعة مع أصدقائكم!",
-                    reply_markup={"inline_keyboard": launcher_buttons},
-                )
-                return
+    # -- routing -------------------------------------------------------
+    @staticmethod
+    def _display_name(user: dict[str, Any]) -> str:
+        name = " ".join(
+            part for part in (user.get("first_name"), user.get("last_name")) if part
+        ).strip()
+        return name or user.get("username") or f"user {user.get('id')}"
 
-        # Handle Messages
-        message = update.get("message")
-        if not message:
-            return
-
-        chat = message.get("chat", {})
+    async def _handle_message(self, message: dict[str, Any]) -> None:
+        chat = message.get("chat") or {}
+        user = message.get("from") or {}
         chat_id = chat.get("id")
-        chat_type = chat.get("type", "")
-        from_user = message.get("from", {})
-        user_id = from_user.get("id")
-        display_name = html.escape((from_user.get("first_name", "") or "").strip() or f"User {user_id}")
-
-        if not chat_id or not user_id:
+        user_id = user.get("id")
+        if chat_id is None or user_id is None:
             return
 
-        # Private DM Handling -> Mark user DM Ready!
-        if chat_type == "private":
-            self.adapter.mark_user_dm_ready(user_id)
-            text = message.get("text", "")
-            if text in ("/help", "/guide", "/rules"):
-                await self.send_message(user_id, HELP_GUIDE_HTML, parse_mode="HTML")
-            else:
-                welcome_dm = (
-                    f"👋 <b>أهلاً بك {display_name}!</b>\n\n"
-                    "✅ <b>تم تفعيل الخاص بنجاح!</b>\n"
-                    "أنت الآن جاهز لاستلام دورك أو الكلمة السرية بالخاص فور بدء الجولة في المجموعة."
-                )
-                await self.send_message(user_id, welcome_dm, parse_mode="HTML")
+        text = (message.get("text") or "").strip()
+        is_private = chat.get("type") == "private"
+
+        if is_private:
+            # Any private message proves the bot can DM this user, which is the
+            # precondition the round-start delivery check depends on.
+            self._adapter.mark_user_dm_ready(user_id)
+            if text.startswith("/start") or text.startswith("/help"):
+                await self._api.send_message(chat_id, PRIVATE_WELCOME)
             return
 
-        # Group Commands
-        text = message.get("text", "")
         if not text.startswith("/"):
             return
 
-        parts = text.split(maxsplit=1)
-        cmd_part = parts[0].split("@")[0].lower()
+        command = text.split()[0].split("@")[0].lower()
+        if command in ("/newgame", "/start", "/game"):
+            await self._adapter.handle_newgame(
+                chat_id, user_id, self._display_name(user)
+            )
+        elif command in ("/cancel", "/cancelgame", "/endgame"):
+            await self._adapter.handle_cancelgame(chat_id, user_id)
+        elif command == "/help":
+            await self._api.send_message(chat_id, HELP_TEXT)
 
-        if cmd_part in ("/help", "/guide", "/rules"):
-            await self.send_message(chat_id, HELP_GUIDE_HTML, parse_mode="HTML")
-        elif cmd_part in ("/settings", "/status"):
-            await self.adapter.handle_refresh_panel(group_chat_id=chat_id)
-        elif cmd_part in ("/newgame", "/start"):
-            await self.adapter.handle_newgame(group_chat_id=chat_id, user_id=user_id, display_name=display_name)
+    async def _handle_callback(self, query: dict[str, Any]) -> None:
+        query_id = query.get("id")
+        user = query.get("from") or {}
+        user_id = user.get("id")
+        message = query.get("message") or {}
+        chat = message.get("chat") or {}
+        chat_id = chat.get("id")
+        data = query.get("data") or ""
 
-    async def run(self) -> None:
-        async with httpx.AsyncClient(timeout=35.0) as client:
-            self.client = client
-            res = await client.get(f"{self.base_url}/getMe")
-            data = res.json()
-            if data.get("ok"):
-                self.bot_username = data["result"].get("username", "guessJobot")
-                self.adapter.bot_username = self.bot_username
-                print(f"[+] Bot connected: @{self.bot_username}")
+        if query_id is None or user_id is None or chat_id is None:
+            return
 
-            print("[*] Telegram Spy Game Bot Long Polling started successfully...")
+        display_name = self._display_name(user)
+        res = None
 
-            offset = 0
-            cleanup_counter = 0
-            while True:
-                try:
-                    res = await client.get(
-                        f"{self.base_url}/getUpdates",
-                        params={"offset": offset, "timeout": 30},
-                        timeout=40.0,
+        try:
+            if data == "join_game":
+                res = await self._adapter.handle_join(chat_id, user_id, display_name)
+            elif data == "leave_game":
+                res = await self._adapter.handle_leave(chat_id, user_id)
+            elif data == "start_game":
+                res = await self._adapter.handle_startgame(chat_id, user_id)
+            elif data == "cancel_game":
+                res = await self._adapter.handle_cancelgame(chat_id, user_id)
+            elif data == "refresh_panel":
+                res = await self._adapter.handle_refresh_panel(chat_id)
+            elif data == "start_voting":
+                res = await self._adapter.handle_start_voting(chat_id)
+            elif data == "spy_guess_menu":
+                res = await self._adapter.handle_spy_guess_menu(chat_id, user_id)
+            elif data.startswith("vote:"):
+                target = self._parse_int(data.partition(":")[2])
+                if target is not None:
+                    res = await self._adapter.handle_spy_vote(chat_id, user_id, target)
+            elif data.startswith("spy_guess:"):
+                index = self._parse_int(data.partition(":")[2])
+                if index is not None:
+                    res = await self._adapter.handle_spy_guess_option(
+                        chat_id, user_id, index
                     )
-                    updates_data = res.json()
-                    if not updates_data.get("ok"):
-                        await asyncio.sleep(2)
-                        continue
-                    updates = updates_data.get("result", [])
-                    for update in updates:
-                        offset = max(offset, update["update_id"] + 1)
-                        asyncio.create_task(self.process_update(update))
+        except Exception:
+            logger.exception("callback %r failed in chat %s", data, chat_id)
 
-                    cleanup_counter += 1
-                    if cleanup_counter >= 100:
-                        cleanup_counter = 0
-                        self.store.cleanup_expired(max_age_seconds=3600)
+        # Telegram keeps the button spinner alive until the query is answered,
+        # so this must happen on every path including failures.
+        alert_text = res.alert_text if res is not None else None
+        show_alert = bool(res.show_alert) if res is not None else False
+        await self._api.answer_callback_query(
+            query_id, alert_text, show_alert=show_alert
+        )
 
-                except Exception as err:
-                    print(f"[Polling Error]: {err}", file=sys.stderr)
-                    await asyncio.sleep(2)
+    @staticmethod
+    def _parse_int(raw: str) -> int | None:
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
+    async def _handle_update(self, update: dict[str, Any]) -> None:
+        if "callback_query" in update:
+            await self._handle_callback(update["callback_query"])
+        elif "message" in update:
+            await self._handle_message(update["message"])
+
+    # -- main loop -----------------------------------------------------
+    async def run(self) -> None:
+        """Poll until stopped, dispatching each update concurrently."""
+        while not self._stopping.is_set():
+            response = await self._api.get_updates(
+                self._offset, timeout=LONG_POLL_SECONDS
+            )
+            if not response.get("ok"):
+                logger.error("getUpdates failed: %s", response.get("description"))
+                await asyncio.sleep(3)
+                continue
+
+            for update in response.get("result", []):
+                update_id = update.get("update_id")
+                if isinstance(update_id, int):
+                    # Advance the offset before handling so a handler crash can
+                    # never turn one poisoned update into an infinite loop.
+                    self._offset = update_id + 1
+                self._spawn(self._guarded(update))
+
+            self._store.cleanup_expired()
+
+    async def _guarded(self, update: dict[str, Any]) -> None:
+        try:
+            await self._handle_update(update)
+        except Exception:
+            logger.exception("failed to handle update %s", update.get("update_id"))
+
+    def request_stop(self) -> None:
+        self._stopping.set()
+
+    async def shutdown(self) -> None:
+        """Release timers and let in-flight handlers finish."""
+        cancelled = self._timers.shutdown()
+        logger.info("cancelled %d pending timer(s)", cancelled)
+        if self._background:
+            await asyncio.wait(set(self._background), timeout=10)
+
+
+# ----------------------------------------------------------------------
+# Bootstrap
+# ----------------------------------------------------------------------
+def _read_token() -> str:
+    token = (os.environ.get("BOT_TOKEN") or "").strip()
+    if not token:
+        sys.stderr.write(
+            "\nBOT_TOKEN is not set.\n\n"
+            "On Render: Dashboard -> your service -> Environment -> Add\n"
+            "  Key   = BOT_TOKEN\n"
+            "  Value = the token from @BotFather\n\n"
+            "Locally:  export BOT_TOKEN='123456789:AA...'\n\n"
+            "The token is read from the environment on purpose: this repository\n"
+            "is public, and a committed token can be used by anyone who reads it.\n\n"
+        )
+        raise SystemExit(2)
+    return token
+
+
+async def _amain() -> int:
+    logging.basicConfig(
+        level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+    )
+
+    token = _read_token()
+    round_seconds = int(os.environ.get("ROUND_SECONDS", "300"))
+
+    # Overridable so the boot path can be exercised against a local stub in
+    # tests; production never sets it.
+    base_url = os.environ.get("TELEGRAM_API_BASE", DEFAULT_BASE_URL)
+    api = TelegramAPI(token, base_url=base_url)
+    me = await api.get_me()
+    if not me.get("ok"):
+        logger.error(
+            "getMe rejected the token: %s. If it was ever committed or shared, "
+            "revoke it with @BotFather (/revoke) and set the new one.",
+            me.get("description"),
+        )
+        return 1
+
+    username = (me.get("result") or {}).get("username", "unknown")
+    logger.info("authenticated as @%s", username)
+
+    # Long polling and a webhook are mutually exclusive; clear any stale one.
+    await api.delete_webhook()
+
+    runner = BotRunner(api, round_seconds=round_seconds, bot_username=username)
+
+    port_value = os.environ.get("PORT")
+    health_server = start_health_server(int(port_value)) if port_value else None
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, runner.request_stop)
+        except NotImplementedError:
+            signal.signal(sig, lambda _sig, _frame: runner.request_stop())
+
+    logger.info("polling started (round length %ds)", round_seconds)
+    try:
+        await runner.run()
+    finally:
+        logger.info("shutting down")
+        await runner.shutdown()
+        if health_server is not None:
+            health_server.shutdown()
+    return 0
+
+
+def main() -> int:
+    try:
+        return asyncio.run(_amain())
+    except KeyboardInterrupt:
+        return 0
 
 
 if __name__ == "__main__":
-    runner = TelegramBotRunner()
-    try:
-        asyncio.run(runner.run())
-    except KeyboardInterrupt:
-        print("\nBot stopped.")
+    raise SystemExit(main())
