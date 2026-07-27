@@ -91,7 +91,10 @@ The bot cannot work in groups without these:
    listed — by design, so a round is never played with a missing role.
 4. The host presses **🚀 بدء اللعبة**.
 
-Commands: `/newgame`, `/cancel` (host only), `/help`.
+Commands: `/newgame`, `/vote`, `/panel`, `/cancel` (host only), `/help`.
+
+`/panel` re-sends the control panel at the bottom of the chat, which is the
+recovery path if the panel has scrolled far up.
 
 ## Limits to be aware of
 

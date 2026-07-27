@@ -37,10 +37,18 @@ LOBBY_BUTTONS = [
     [{"text": "📌 أظهر لوحة الأزرار بالأسفل", "callback_data": "refresh_panel"}],
 ]
 
+# The spy's guess button deliberately does NOT live here.  ``build_spy_guess_menu``
+# requires ``spy_guessing_active``, which only becomes true after a ballot
+# exposes the spy, so offering it during discussion produced a button that
+# always answered "التخمين غير متاح حالياً".  It is attached to the
+# spy-exposed message instead, which is the only moment it can work.
 ACTIVE_PANEL_BUTTONS = [
     [{"text": "🗳️ بدء التصويت على الجاسوس", "callback_data": "start_voting"}],
-    [{"text": "💡 تخمين الكلمة السرية (الجاسوس)", "callback_data": "spy_guess_menu"}],
     [{"text": "📌 أظهر لوحة الأزرار بالأسفل", "callback_data": "refresh_panel"}],
+]
+
+SPY_GUESS_BUTTONS = [
+    [{"text": "💡 تخمين الكلمة السرية (الجاسوس)", "callback_data": "spy_guess_menu"}],
 ]
 
 
@@ -312,6 +320,13 @@ class SessionManager:
                 "• ابدأوا النقاش والأسئلة فوراً في المحادثة.\n"
                 "• عند الجاهزية، اضغطوا <b>🗳️ بدء التصويت على الجاسوس</b> أدناه."
             ),
+            # This message told players to press a button "أدناه" while carrying
+            # no keyboard at all, so a started round had no reachable panel.
+            buttons=[list(row) for row in ACTIVE_PANEL_BUTTONS],
+            # Sent as a new message (not an edit) so the panel sits at the
+            # bottom of the chat, and the now-obsolete lobby keyboard above it
+            # is stripped rather than left clickable.
+            disable_previous_message_id=session.control_message_id,
         )
         notifications: list[Notification] = [group_announcement]
 
@@ -326,7 +341,7 @@ class SessionManager:
                         channel="dm",
                         target_id=player.user_id,
                         text=(
-                            "🚨 <b>أنت الجاسوس الوحيد في هذه الجولة! 🕵️‍♂️</b>\n\n"
+                            "🚨 <b>أنت الجاسوس الوحيد في هذه الجولة! 🕵️♂️</b>\n\n"
                             "❌ أنت لا تعرف الكلمة السرية للموقع!\n"
                             "💡 تظاهر بأنك تعرف الكلمة واستمع لأسئلة المنافسين في المحادثة بذكاء حتى تكتشف المكان!"
                         ),
@@ -504,17 +519,10 @@ class SessionManager:
         session.votes.clear()
         session.eligible_vote_targets = [p.user_id for p in active_players]
 
-        notif = Notification(
-            channel="group",
-            target_id=group_chat_id,
-            text=(
-                "🗳️ <b>بدأ التصويت على الجاسوس!</b>\n\n"
-                "اضغط على اسم اللاعب الذي تشك أنه الجاسوس أدناه:"
-            ),
-            buttons=self._build_vote_buttons(active_players),
-            edit_message_id=session.control_message_id,
-        )
         self._store.put(session)
+        notif = self._panel_update(
+            session, self._vote_progress_text(session, active_players)
+        )
         return OperationResult(ok=True, notifications=[notif], session=session)
 
     def record_spy_vote(
@@ -562,22 +570,21 @@ class SessionManager:
         active_players = [p for p in session.players.values() if p.active]
         total_active = len(active_players)
         voted_count = len(session.votes)
-        voter_name = session.players[voter_id].display_name
-
-        vote_recorded = Notification(
-            channel="group",
-            target_id=group_chat_id,
-            text=f"🗳️ قام <b>{voter_name}</b> بالتصويت! ({voted_count}/{total_active} أصوات)",
-            edit_message_id=session.control_message_id,
-        )
 
         if voted_count < total_active:
             self._store.put(session)
+            # Refresh the ballot in place, keyboard intact, so the remaining
+            # voters can still act.  This used to be an edit with no buttons,
+            # which deleted the ballot after the very first vote.
             return OperationResult(
                 ok=True,
                 alert_text="✅ تم تسجيل صوتك بنجاح!",
                 show_alert=True,
-                notifications=[vote_recorded],
+                notifications=[
+                    self._panel_update(
+                        session, self._vote_progress_text(session, active_players)
+                    )
+                ],
                 session=session,
             )
 
@@ -594,20 +601,18 @@ class SessionManager:
             session.votes.clear()
             session.eligible_vote_targets = [p.user_id for p in active_players]
             self._store.put(session)
-            tie_notif = Notification(
-                channel="group",
-                target_id=group_chat_id,
-                text=(
-                    "⚖️ <b>تعادل في التصويت!</b>\n\n"
-                    "لم يتم إقصاء أي لاعب. تابعوا النقاش وأعيدوا فتح التصويت عند الجاهزية."
-                ),
-                edit_message_id=session.control_message_id,
+            # The ballot is closed but the round continues, so the panel must
+            # come back with the "reopen voting" keyboard rather than none.
+            tie_notif = self._panel_update(
+                session,
+                "⚖️ <b>تعادل في التصويت!</b>\n\n"
+                "لم يتم إقصاء أي لاعب. تابعوا النقاش وأعيدوا فتح التصويت عند الجاهزية.",
             )
             return OperationResult(
                 ok=True,
                 alert_text="⚖️ تعادل! لم يُقصَ أحد.",
                 show_alert=True,
-                notifications=[vote_recorded, tie_notif],
+                notifications=[tie_notif],
                 session=session,
             )
 
@@ -620,21 +625,19 @@ class SessionManager:
             session.spy_guessing_active = True
             session.spy_guess_attempted = False
             self._store.put(session)
-            caught_notif = Notification(
-                channel="group",
-                target_id=group_chat_id,
-                text=(
-                    f"🎯 <b>تم كشف الجاسوس: {accused_name}! 🕵️‍♂️</b>\n\n"
-                    "💡 لديه فرصة أخيرة لتخمين الكلمة السرية للفوز."
-                ),
-                buttons=[[{"text": "💡 تخمين الكلمة السرية (الجاسوس)", "callback_data": "spy_guess_menu"}]],
-                edit_message_id=session.control_message_id,
+            # ``_panel_buttons`` now resolves to the spy-guess keyboard, which
+            # is the only state where that button is actionable.
+            caught_notif = self._panel_update(
+                session,
+                f"🎯 <b>تم كشف الجاسوس: {accused_name}! 🕵️♂️</b>\n\n"
+                f"🗳️ صوّت ضده <b>{max_votes}</b> من {total_active}.\n"
+                "💡 لديه فرصة أخيرة لتخمين الكلمة السرية للفوز.",
             )
             return OperationResult(
                 ok=True,
                 alert_text="🎯 تم كشف الجاسوس!",
                 show_alert=True,
-                notifications=[vote_recorded, caught_notif],
+                notifications=[caught_notif],
                 session=session,
             )
 
@@ -646,22 +649,20 @@ class SessionManager:
         if self._timer_service is not None:
             self._timer_service.cancel(group_chat_id)
         self._store.put(session)
-        win_notif = Notification(
-            channel="group",
-            target_id=group_chat_id,
-            text=(
-                "🎉 <b>فاز الجاسوس! 🕵️🏆</b>\n\n"
-                f"قام الجميع بطرد خاطئ لـ <b>{accused_name}</b>!\n"
-                f"بينما الجاسوس الحقيقي <b>{spy_name}</b> نجح بالتمويه والمكر وخدع الجميع!\n"
-                f"📍 المكان السري كان: <b>{secret_name}</b>"
-            ),
-            edit_message_id=session.control_message_id,
+        # Terminal: _panel_buttons returns None here, which is the one case
+        # where dropping the keyboard is correct.
+        win_notif = self._panel_update(
+            session,
+            "🎉 <b>فاز الجاسوس! 🕵️🏆</b>\n\n"
+            f"قام الجميع بطرد خاطئ لـ <b>{accused_name}</b>!\n"
+            f"بينما الجاسوس الحقيقي <b>{spy_name}</b> نجح بالتمويه والمكر وخدع الجميع!\n"
+            f"📍 المكان السري كان: <b>{secret_name}</b>",
         )
         return OperationResult(
             ok=True,
             alert_text="🎉 فاز الجاسوس!",
             show_alert=True,
-            notifications=[vote_recorded, win_notif],
+            notifications=[win_notif],
             session=session,
         )
 
@@ -714,12 +715,12 @@ class SessionManager:
 
         if correct:
             text = (
-                "🎉 <b>تخمين عبقري من الجاسوس! 🕵️‍♂️🏆</b>\n\n"
+                "🎉 <b>تخمين عبقري من الجاسوس! 🕵️♂️🏆</b>\n\n"
                 f"عرف الجاسوس <b>{spy_name}</b> المكان السري الصحيح وهو: <b>{secret_name}</b> وفاز بالجولة!"
             )
         else:
             text = (
-                "❌ <b>تخمين خاطئ من الجاسوس! 🕵️‍♂️</b>\n\n"
+                "❌ <b>تخمين خاطئ من الجاسوس! 🕵️♂️</b>\n\n"
                 f"حاول الجاسوس {spy_name} التخمين لكن الإجابة كانت خاطئة!\n"
                 f"🤫 المكان السري الحقيقي كان: <b>{secret_name}</b>\n\n"
                 "🏆 <b>فاز المواطنون الشرفاء بالجولة! 👥🎉</b>"
@@ -922,19 +923,96 @@ class SessionManager:
     # Panel / helpers
     # ------------------------------------------------------------------
     def build_status_panel_notification(self, group_chat_id: int, header: str) -> Notification:
-        """Build the current control panel notification for a group."""
+        """Build a fresh control panel reflecting the session's current state.
+
+        The keyboard is derived from the live state rather than hardcoded to the
+        discussion panel, otherwise re-showing the panel mid-ballot replaced the
+        open vote buttons with a "start voting" button and stranded the round.
+        """
         session = self._store.get(group_chat_id)
-        body = (
-            "🕵️ <b>لوحة التحكم للجولة النشطة:</b>\n"
-            "الأسئلة مستمرة في المجموعة! عند الجاهزية اضغط زر التصويت أدناه."
-        )
+        if session is None:
+            return Notification(
+                channel="group",
+                target_id=group_chat_id,
+                text=f"{header}\n\n⚠️ لا توجد لعبة نشطة في هذه المجموعة.",
+            )
+
+        if session.state is GameState.LOBBY:
+            body = (
+                f"👥 <b>اللوبي مفتوح:</b> "
+                f"({len(session.players)}/{session.max_players} لاعبين)\n"
+                "اضغط <b>➕ انضمام للعبة</b>، ثم يبدأ المنشئ الجولة."
+            )
+        elif session.spy_guessing_active:
+            body = "🎯 تم كشف الجاسوس! أمامه فرصة تخمين واحدة أدناه."
+        elif session.voting_active:
+            active_players = [p for p in session.players.values() if p.active]
+            body = self._vote_progress_text(session, active_players)
+        else:
+            body = (
+                "🕵️ <b>لوحة التحكم للجولة النشطة:</b>\n"
+                "الأسئلة مستمرة في المجموعة! عند الجاهزية اضغط زر التصويت أدناه."
+            )
+
         return Notification(
             channel="group",
             target_id=group_chat_id,
             text=f"{header}\n\n{body}",
-            buttons=[list(row) for row in ACTIVE_PANEL_BUTTONS],
-            edit_message_id=session.control_message_id if session else None,
+            buttons=self._panel_buttons(session),
         )
+
+    def _panel_buttons(self, session: GameSession) -> list[list[dict[str, str]]] | None:
+        """Return the keyboard that matches the session's current state.
+
+        Every notification that edits the control panel must pass its result
+        through here.  Editing a message without ``reply_markup`` strips its
+        keyboard permanently, which previously left the group with no way to
+        act and the round unfinishable.
+        """
+        if session.terminal:
+            return None
+        if session.state is GameState.LOBBY:
+            return [list(row) for row in LOBBY_BUTTONS]
+        if session.state is GameState.GUESSING:
+            if session.spy_guessing_active:
+                return [list(row) for row in SPY_GUESS_BUTTONS]
+            if session.voting_active:
+                active_players = [p for p in session.players.values() if p.active]
+                return self._build_vote_buttons(active_players)
+            return [list(row) for row in ACTIVE_PANEL_BUTTONS]
+        return [list(row) for row in ACTIVE_PANEL_BUTTONS]
+
+    def _panel_update(self, session: GameSession, text: str) -> Notification:
+        """Build an in-place panel edit that always carries a live keyboard."""
+        return Notification(
+            channel="group",
+            target_id=session.group_chat_id,
+            text=text,
+            buttons=self._panel_buttons(session),
+            edit_message_id=session.control_message_id,
+        )
+
+    @staticmethod
+    def _vote_progress_text(session: GameSession, active_players: list[Player]) -> str:
+        """Render the ballot with who has already voted and who is pending."""
+        voted = [
+            session.players[uid].display_name
+            for uid in session.votes
+            if uid in session.players
+        ]
+        pending = [p.display_name for p in active_players if p.user_id not in session.votes]
+        lines = [
+            "🗳️ <b>التصويت على الجاسوس جارٍ!</b>",
+            "",
+            f"📊 الأصوات: <b>{len(session.votes)}/{len(active_players)}</b>",
+        ]
+        if voted:
+            lines.append("✅ صوّتوا: " + "، ".join(voted))
+        if pending:
+            lines.append("⏳ بانتظار: " + "، ".join(pending))
+        lines.append("")
+        lines.append("اضغط على اسم اللاعب الذي تشك أنه الجاسوس أدناه:")
+        return "\n".join(lines)
 
     def _build_vote_buttons(self, active_players: list[Player]) -> list[list[dict[str, str]]]:
         buttons: list[list[dict[str, str]]] = []

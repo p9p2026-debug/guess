@@ -41,6 +41,8 @@ HELP_TEXT = (
     "🕵️ <b>لعبة الجاسوس والكلمة السرية</b>\n\n"
     "<b>الأوامر:</b>\n"
     "/newgame — فتح لوبي لعبة جديدة في المجموعة\n"
+    "/vote — فتح التصويت على الجاسوس\n"
+    "/panel — إظهار لوحة الأزرار من جديد بأسفل المحادثة\n"
     "/cancel — إلغاء اللعبة الحالية (المنشئ فقط)\n"
     "/help — عرض هذه الرسالة\n\n"
     "<b>كيف تلعبون:</b>\n"
@@ -172,14 +174,29 @@ class BotRunner:
             return
 
         command = text.split()[0].split("@")[0].lower()
+        res = None
+
         if command in ("/newgame", "/start", "/game"):
-            await self._adapter.handle_newgame(
+            res = await self._adapter.handle_newgame(
                 chat_id, user_id, self._display_name(user)
             )
         elif command in ("/cancel", "/cancelgame", "/endgame"):
-            await self._adapter.handle_cancelgame(chat_id, user_id)
+            res = await self._adapter.handle_cancelgame(chat_id, user_id)
+        elif command in ("/vote", "/voting"):
+            res = await self._adapter.handle_start_voting(chat_id)
+        elif command in ("/panel", "/buttons"):
+            res = await self._adapter.handle_refresh_panel(chat_id)
         elif command == "/help":
             await self._api.send_message(chat_id, HELP_TEXT)
+            return
+        else:
+            return
+
+        # A rejected command carries its explanation in alert_text, which only
+        # button presses can display. Without this the group saw total silence
+        # and the bot looked frozen.
+        if res is not None and not res.ok and not res.notifications and res.alert_text:
+            await self._api.send_message(chat_id, res.alert_text)
 
     async def _handle_callback(self, query: dict[str, Any]) -> None:
         query_id = query.get("id")

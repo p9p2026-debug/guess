@@ -34,6 +34,9 @@ class FakeAPI:
         self.sent: list[dict[str, Any]] = []
         self.edited: list[dict[str, Any]] = []
         self.markup_edits: list[dict[str, Any]] = []
+        #: Single chronological log. ``sent`` and ``edited`` are separate views,
+        #: so concatenating them does not preserve call order.
+        self.log: list[dict[str, Any]] = []
         self._next_message_id = 1000
 
     async def send_message(self, chat_id, text, reply_markup=None):
@@ -44,15 +47,26 @@ class FakeAPI:
                 "description": "Forbidden: bot was blocked by the user",
             }
         self._next_message_id += 1
-        self.sent.append(
-            {"chat_id": chat_id, "text": text, "reply_markup": reply_markup}
-        )
+        call = {
+            "kind": "send",
+            "chat_id": chat_id,
+            "text": text,
+            "reply_markup": reply_markup,
+        }
+        self.sent.append(call)
+        self.log.append(call)
         return {"ok": True, "result": {"message_id": self._next_message_id}}
 
     async def edit_message_text(self, chat_id, message_id, text, reply_markup=None):
-        self.edited.append(
-            {"chat_id": chat_id, "message_id": message_id, "text": text}
-        )
+        call = {
+            "kind": "edit",
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "reply_markup": reply_markup,
+        }
+        self.edited.append(call)
+        self.log.append(call)
         return {"ok": True, "result": {"message_id": message_id}}
 
     async def edit_message_reply_markup(self, chat_id, message_id, reply_markup=None):
@@ -62,6 +76,14 @@ class FakeAPI:
     # -- assertions helpers -------------------------------------------
     def texts_to(self, chat_id: int) -> list[str]:
         return [call["text"] for call in self.sent if call["chat_id"] == chat_id]
+
+    def group_traffic(self) -> list[dict[str, Any]]:
+        """Every group-facing call, sends and edits, in chronological order."""
+        return [call for call in self.log if call["chat_id"] == GROUP]
+
+    def last_group_markup(self) -> dict[str, Any] | None:
+        traffic = self.group_traffic()
+        return traffic[-1]["reply_markup"] if traffic else None
 
     def all_texts(self) -> str:
         return "\n".join(call["text"] for call in self.sent) + "\n".join(
@@ -310,6 +332,195 @@ def test_timer_from_previous_generation_cannot_touch_a_new_session():
 
         assert second.state is GameState.GUESSING, "stale timer ended the new round"
         assert collected == [], "stale timer produced output"
+
+    asyncio.run(scenario())
+
+
+def _button_labels(markup: dict[str, Any] | None) -> list[str]:
+    if not markup:
+        return []
+    return [
+        button["text"]
+        for row in markup.get("inline_keyboard", [])
+        for button in row
+    ]
+
+
+def test_a_panel_edit_never_strips_the_keyboard_mid_game():
+    """Structural invariant: the round must always stay actionable.
+
+    Regression for the whole class of bug behind "the buttons vanish forever".
+    Editing a Telegram message without ``reply_markup`` deletes its keyboard, so
+    any panel edit issued while the session is still live must carry one.
+    """
+
+    async def scenario():
+        api, store, adapter, manager, timers, scheduler, _ = build()
+        players = [(1, "سالم"), (2, "ليان"), (3, "عمر")]
+        offenders: list[str] = []
+
+        def audit(label, res):
+            session = store.get(GROUP)
+            for notif in res.notifications:
+                if notif.channel != "group" or notif.edit_message_id is None:
+                    continue
+                alive = session is not None and not session.terminal
+                if alive and not notif.buttons:
+                    offenders.append(f"{label}: edit with no keyboard")
+
+        audit("newgame", await adapter.handle_newgame(GROUP, 1, "سالم"))
+        for uid, name in players[1:]:
+            audit("join", await adapter.handle_join(GROUP, uid, name))
+        audit("startgame", await adapter.handle_startgame(GROUP, 1))
+        audit("start_voting", await adapter.handle_start_voting(GROUP))
+
+        spy_id = store.get(GROUP).spy_user_id
+        for uid, _ in players:
+            audit("vote", await adapter.handle_spy_vote(GROUP, uid, spy_id))
+        audit("guess_menu", await adapter.handle_spy_guess_menu(GROUP, spy_id))
+        audit("refresh", await adapter.handle_refresh_panel(GROUP))
+
+        assert offenders == [], offenders
+
+    asyncio.run(scenario())
+
+
+def test_ballot_survives_the_first_vote():
+    """Regression: the first vote used to replace the ballot with a plain text
+    edit, deleting the keyboard so nobody else could ever vote."""
+
+    async def scenario():
+        api, store, adapter, *_ = build()
+        players = [(1, "سالم"), (2, "ليان"), (3, "عمر")]
+        await open_lobby(adapter, players)
+        await adapter.handle_startgame(GROUP, 1)
+        await adapter.handle_start_voting(GROUP)
+        session = store.get(GROUP)
+        spy_id = session.spy_user_id
+
+        await adapter.handle_spy_vote(GROUP, 1, spy_id)
+
+        labels = _button_labels(api.last_group_markup())
+        assert labels, "the ballot keyboard was destroyed by the first vote"
+        # All three candidates are still votable.
+        for _, name in players:
+            assert any(name in label for label in labels), (name, labels)
+
+        # And the remaining voters really can still vote.
+        assert (await adapter.handle_spy_vote(GROUP, 2, spy_id)).ok
+        assert (await adapter.handle_spy_vote(GROUP, 3, spy_id)).ok
+        assert session.spy_guessing_active is True
+
+    asyncio.run(scenario())
+
+
+def test_started_round_announcement_carries_the_active_panel():
+    """Regression: the message said "اضغطوا أدناه" while carrying no keyboard."""
+
+    async def scenario():
+        api, store, adapter, *_ = build()
+        await open_lobby(adapter, [(1, "سالم"), (2, "ليان"), (3, "عمر")])
+        await adapter.handle_startgame(GROUP, 1)
+
+        labels = _button_labels(api.last_group_markup())
+        assert any("بدء التصويت" in label for label in labels), labels
+
+    asyncio.run(scenario())
+
+
+def test_discussion_panel_omits_the_dead_spy_guess_button():
+    """The spy guess button only works once the spy is exposed, so it must not
+    be offered during discussion where it could only ever answer "unavailable"."""
+
+    async def scenario():
+        api, store, adapter, *_ = build()
+        await open_lobby(adapter, [(1, "سالم"), (2, "ليان"), (3, "عمر")])
+        await adapter.handle_startgame(GROUP, 1)
+        labels = _button_labels(api.last_group_markup())
+        # Guard against passing vacuously on an empty keyboard.
+        assert labels, "the discussion panel has no keyboard at all"
+        assert not any("تخمين" in label for label in labels), labels
+
+        # It appears exactly when it becomes actionable.
+        await adapter.handle_start_voting(GROUP)
+        spy_id = store.get(GROUP).spy_user_id
+        for uid in (1, 2, 3):
+            await adapter.handle_spy_vote(GROUP, uid, spy_id)
+        labels = _button_labels(api.last_group_markup())
+        assert any("تخمين" in label for label in labels), labels
+
+    asyncio.run(scenario())
+
+
+def test_refreshing_the_panel_mid_ballot_keeps_vote_buttons():
+    """Regression: refresh_panel hardcoded the discussion keyboard, so using it
+    during a ballot swapped the vote buttons for "start voting"."""
+
+    async def scenario():
+        api, store, adapter, *_ = build()
+        await open_lobby(adapter, [(1, "سالم"), (2, "ليان"), (3, "عمر")])
+        await adapter.handle_startgame(GROUP, 1)
+        await adapter.handle_start_voting(GROUP)
+
+        await adapter.handle_refresh_panel(GROUP)
+        labels = _button_labels(api.last_group_markup())
+        assert any("سالم" in label for label in labels), labels
+        assert not any("بدء التصويت" in label for label in labels), labels
+
+        # Voting through the refreshed panel still works.
+        assert (await adapter.handle_spy_vote(GROUP, 1, store.get(GROUP).spy_user_id)).ok
+
+    asyncio.run(scenario())
+
+
+def test_tie_reopens_the_panel_instead_of_stranding_the_round():
+    """Regression: the tie message dropped the keyboard, leaving no way to
+    reopen voting and no way to finish the round."""
+
+    async def scenario():
+        api, store, adapter, *_ = build()
+        await open_lobby(adapter, [(1, "سالم"), (2, "ليان"), (3, "عمر")])
+        await adapter.handle_startgame(GROUP, 1)
+        await adapter.handle_start_voting(GROUP)
+
+        # Three voters, three different targets -> a three-way tie.
+        await adapter.handle_spy_vote(GROUP, 1, 2)
+        await adapter.handle_spy_vote(GROUP, 2, 3)
+        await adapter.handle_spy_vote(GROUP, 3, 1)
+
+        session = store.get(GROUP)
+        assert session.voting_active is False
+        assert session.state is GameState.GUESSING, "a tie must not end the round"
+        labels = _button_labels(api.last_group_markup())
+        assert any("بدء التصويت" in label for label in labels), labels
+        # Voting can genuinely be reopened.
+        assert (await adapter.handle_start_voting(GROUP)).ok
+
+    asyncio.run(scenario())
+
+
+def test_rejected_command_carries_text_for_the_group_to_see():
+    """A command rejection must be renderable as a message.
+
+    alert_text is only displayable on a button press, so run_bot relays it as a
+    group message. That relay is only possible if the manager supplies text.
+    """
+
+    async def scenario():
+        api, store, adapter, *_ = build()
+        await open_lobby(adapter, [(1, "سالم"), (2, "ليان")])
+
+        duplicate = await adapter.handle_newgame(GROUP, 9, "دخيل")
+        assert not duplicate.ok
+        assert duplicate.alert_text, "nothing to show the group; bot looks frozen"
+
+        not_host = await adapter.handle_cancelgame(GROUP, 2)
+        assert not not_host.ok
+        assert not_host.alert_text
+
+        too_few = await adapter.handle_start_voting(GROUP)
+        assert not too_few.ok
+        assert too_few.alert_text
 
     asyncio.run(scenario())
 
