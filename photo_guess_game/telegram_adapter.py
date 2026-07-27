@@ -110,6 +110,73 @@ class TelegramAdapter:
                     )
 
 
+    def _build_status_panel_notification(
+        self, group_chat_id: int, prefix_text: str
+    ) -> Notification:
+        session = self._store.get(group_chat_id)
+        if session is None or session.state not in (GameState.LOBBY, GameState.GUESSING):
+            return Notification(
+                channel="group",
+                target_id=group_chat_id,
+                text=f"{prefix_text}\n\n💡 أرسل <code>/newgame</code> لإنشاء لعبة جديدة!",
+            )
+
+        if session.state == GameState.LOBBY:
+            players_list = ", ".join([f"<b>{p.display_name}</b>" for p in session.players.values()])
+            text = (
+                f"{prefix_text}\n\n"
+                f"📋 <b>لوحة تحكم اللوبي الحالية:</b>\n"
+                f"👥 <b>اللاعبون المنضمون ({len(session.players)}/{session.max_players}):</b> {players_list}\n"
+                f"⏱️ <b>الوقت:</b> {session.guessing_timeout_seconds // 60} دقيقة"
+            )
+            buttons = [
+                [
+                    {"text": "➕ انضمام للعبة", "callback_data": "join_game"},
+                    {"text": "🚪 مغادرة اللعبة", "callback_data": "leave_game"},
+                ],
+                [
+                    {"text": "🚀 بدء اللعبة", "callback_data": "start_game"},
+                    {"text": "❌ إلغاء اللعبة", "callback_data": "cancel_game"},
+                ],
+            ]
+            return Notification(channel="group", target_id=group_chat_id, text=text, buttons=buttons)
+
+        # GameState.GUESSING
+        if session.voting_active:
+            vote_buttons = [
+                [{"text": f"👤 {p.display_name}", "callback_data": f"vote:{pid}"}]
+                for pid, p in session.players.items()
+            ]
+            voted_count = len(session.votes)
+            total_players = len(session.players)
+            text = (
+                f"{prefix_text}\n\n"
+                f"🗳️ <b>لوحة التصويت الحالية:</b>\n"
+                f"اختر الشخص المشتبه به أنه الجاسوس!\n"
+                f"📊 <b>الأصوات المسجلة:</b> ({voted_count}/{total_players})"
+            )
+            return Notification(channel="group", target_id=group_chat_id, text=text, buttons=vote_buttons)
+        else:
+            spy_buttons = [
+                [{"text": "🗳️ بدء التصويت على الجاسوس", "callback_data": "start_voting"}],
+                [{"text": "💡 تخمين الكلمة السرية (الجاسوس)", "callback_data": "spy_guess_menu"}],
+            ]
+            text = (
+                f"{prefix_text}\n\n"
+                f"🕵️ <b>لوحة التحكم للجولة النشطة:</b>\n"
+                f"الأسئلة مستمرة في المجموعة! عند الجاهزية اضغط زر التصويت أدناه."
+            )
+            return Notification(channel="group", target_id=group_chat_id, text=text, buttons=spy_buttons)
+
+    async def handle_status(self, group_chat_id: int) -> OperationResult:
+        """Handle /status or /settings command to resend current control panel at bottom."""
+        async with self._store.lock_for(group_chat_id):
+            notif = self._build_status_panel_notification(
+                group_chat_id, "⚙️ <b>لوحة التحكم الحالية للعبة:</b>"
+            )
+            await self.dispatch_notifications([notif])
+            return OperationResult(ok=True, notifications=[notif])
+
     async def handle_newgame(
         self, group_chat_id: int, user_id: int, display_name: str
     ) -> OperationResult:
@@ -120,10 +187,8 @@ class TelegramAdapter:
             )
             if not res.ok and not res.notifications:
                 res.notifications = [
-                    Notification(
-                        channel="group",
-                        target_id=group_chat_id,
-                        text="⚠️ <b>تنبيه:</b> هناك لعبة نشطة حالياً في هذه المجموعة!",
+                    self._build_status_panel_notification(
+                        group_chat_id, "⚠️ <b>تنبيه:</b> هناك لعبة نشطة حالياً في هذه المجموعة!"
                     )
                 ]
             await self.dispatch_notifications(res.notifications)
@@ -144,7 +209,7 @@ class TelegramAdapter:
                     "lobby_full": "⚠️ اللوبي ممتلئ بحده الأقصى من اللاعبين.",
                 }.get(res.reason or "", "⚠️ تعذر الانضمام للعبة.")
                 res.notifications = [
-                    Notification(channel="group", target_id=group_chat_id, text=err_text)
+                    self._build_status_panel_notification(group_chat_id, err_text)
                 ]
             await self.dispatch_notifications(res.notifications)
             return res
@@ -161,7 +226,7 @@ class TelegramAdapter:
                     "already_inactive": "⚠️ لقد غادرت اللعبة مسبقاً.",
                 }.get(res.reason or "", "⚠️ لا يمكن المغادرة في الوقت الحالي.")
                 res.notifications = [
-                    Notification(channel="group", target_id=group_chat_id, text=err_text)
+                    self._build_status_panel_notification(group_chat_id, err_text)
                 ]
             await self.dispatch_notifications(res.notifications)
             return res
@@ -182,7 +247,7 @@ class TelegramAdapter:
                     "missing_photos": "⚠️ لم يرسل جميع اللاعبين صورهم بالخاص بعد.",
                 }.get(res.reason or "", "⚠️ تعذر بدء اللعبة.")
                 res.notifications = [
-                    Notification(channel="group", target_id=group_chat_id, text=err_text)
+                    self._build_status_panel_notification(group_chat_id, err_text)
                 ]
             await self.dispatch_notifications(res.notifications)
             return res
@@ -202,10 +267,11 @@ class TelegramAdapter:
                     "not_host": "⚠️ عذراً، فقط منشئ اللعبة (Host) يمكنه إلغاء اللعبة.",
                 }.get(res.reason or "", "⚠️ تعذر إلغاء اللعبة.")
                 res.notifications = [
-                    Notification(channel="group", target_id=group_chat_id, text=err_text)
+                    self._build_status_panel_notification(group_chat_id, err_text)
                 ]
             await self.dispatch_notifications(res.notifications)
             return res
+
 
     async def handle_settimeout(
         self, group_chat_id: int, user_id: int, minutes_str: str

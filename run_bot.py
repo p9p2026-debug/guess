@@ -297,11 +297,12 @@ class TelegramBotRunner:
             await self.send_message(chat_id, HELP_GUIDE_HTML, parse_mode="HTML")
             return
 
-        if cmd_part in ("/newgame", "/start"):
+        if cmd_part in ("/settings", "/status"):
+            await self.adapter.handle_status(group_chat_id=chat_id)
+        elif cmd_part in ("/newgame", "/start"):
             await self.adapter.handle_newgame(
                 group_chat_id=chat_id, user_id=user_id, display_name=display_name
             )
-
         elif cmd_part == "/join":
             await self.adapter.handle_join(
                 group_chat_id=chat_id, user_id=user_id, display_name=display_name
@@ -322,6 +323,7 @@ class TelegramBotRunner:
             await self.adapter.handle_guess(
                 group_chat_id=chat_id, guesser_id=user_id, text_args=args
             )
+
 
 
 
