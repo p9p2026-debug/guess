@@ -82,7 +82,12 @@ class SessionManager:
         self, group_chat_id: int, host_id: int, host_name: str
     ) -> OperationResult:
         existing = self._store.get(group_chat_id)
-        if existing is not None and existing.state == GameState.GUESSING:
+        current_time = time.time()
+        if (
+            existing is not None
+            and existing.state in _ACTIVE_STATES
+            and (current_time - existing.created_at < 3600)
+        ):
             return OperationResult(
                 ok=False, reason="session_already_active", session=existing
             )
@@ -93,9 +98,10 @@ class SessionManager:
             host_id=host_id,
             state=GameState.LOBBY,
             players={host_id: host},
-            created_at=time.time(),
+            created_at=current_time,
         )
         self._store.put(session)
+
 
 
         announcement = Notification(

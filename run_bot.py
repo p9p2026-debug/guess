@@ -70,35 +70,34 @@ class TelegramBotRunner:
     ) -> None:
         if self.client is None:
             return
-        try:
-            payload: dict = {"chat_id": target_id, "text": text, "parse_mode": parse_mode}
-            if reply_markup:
-                payload["reply_markup"] = reply_markup
-            await self.client.post(
-                f"{self.base_url}/sendMessage", json=payload, timeout=10.0
-            )
-        except Exception as err:
-            print(f"[Error sending message to {target_id}]: {err}", file=sys.stderr)
+        payload: dict = {"chat_id": target_id, "text": text, "parse_mode": parse_mode}
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        res = await self.client.post(
+            f"{self.base_url}/sendMessage", json=payload, timeout=10.0
+        )
+        res.raise_for_status()
+        data = res.json()
+        if not data.get("ok"):
+            raise RuntimeError(f"Telegram API error: {data.get('description')}")
 
     async def send_photo(
         self, target_id: int, photo_file_id: str, caption: str, reply_markup: dict | None = None, parse_mode: str = "HTML"
     ) -> None:
         if self.client is None:
             return
-        try:
-            payload: dict = {
-                "chat_id": target_id,
-                "photo": photo_file_id,
-                "caption": caption,
-                "parse_mode": parse_mode,
-            }
-            if reply_markup:
-                payload["reply_markup"] = reply_markup
-            await self.client.post(
-                f"{self.base_url}/sendPhoto", json=payload, timeout=10.0
-            )
-        except Exception as err:
-            print(f"[Error sending photo to {target_id}]: {err}", file=sys.stderr)
+        payload: dict = {
+            "chat_id": target_id,
+            "photo": photo_file_id,
+            "caption": caption,
+            "parse_mode": parse_mode,
+        }
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        res = await self.client.post(
+            f"{self.base_url}/sendPhoto", json=payload, timeout=10.0
+        )
+        res.raise_for_status()
 
     async def answer_callback_query(
         self, callback_query_id: str, text: str = "", show_alert: bool = False
@@ -111,11 +110,13 @@ class TelegramBotRunner:
                 "text": text,
                 "show_alert": show_alert,
             }
-            await self.client.post(
+            res = await self.client.post(
                 f"{self.base_url}/answerCallbackQuery", json=payload, timeout=10.0
             )
+            res.raise_for_status()
         except Exception as err:
             print(f"[Error answering callback query]: {err}", file=sys.stderr)
+
 
 
     async def run(self) -> None:
