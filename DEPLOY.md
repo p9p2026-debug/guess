@@ -51,7 +51,6 @@ Then **Environment** → **Add Environment Variable**:
 | --- | --- | --- |
 | `BOT_TOKEN` | token from [@BotFather](https://t.me/BotFather) | **yes** |
 | `PYTHON_VERSION` | `3.13.4` | no |
-| `ROUND_SECONDS` | `300` | no |
 | `LOG_LEVEL` | `INFO` | no |
 
 The token is read from the environment and is deliberately not accepted from a
@@ -95,6 +94,25 @@ Commands: `/newgame`, `/vote`, `/panel`, `/cancel` (host only), `/help`.
 
 `/panel` re-sends the control panel at the bottom of the chat, which is the
 recovery path if the panel has scrolled far up.
+
+## Game rules as implemented
+
+- 3 to 15 players. Exactly one spy, chosen at random.
+- Citizens receive the secret location by DM; the spy receives nothing.
+- **No round timer.** A round ends by a ballot, or when the host presses
+  **🏁 إنهاء الجولة وكشف الجاسوس**.
+- A player cannot vote for themselves.
+- A ballot tallies once every active player has voted, or earlier when the host
+  presses **🔒 إغلاق التصويت وفرز الأصوات** (requires at least one vote). Without
+  this, a single player who never votes would stall the round permanently.
+- Tie: nobody is eliminated, the round continues.
+- Majority hits the spy: the spy gets **one** multiple-choice guess at the
+  location. Correct, the spy wins; wrong, the citizens win.
+- Majority hits an innocent: the spy wins immediately.
+
+Every keyboard, in every state including after the game ends, carries
+**🏠 القائمة الرئيسية** and **🎮 قائمة اللعبة**, so the group always has
+something to press.
 
 ## Limits to be aware of
 

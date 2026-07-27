@@ -20,15 +20,13 @@ class TelegramAdapter:
         self,
         store: SessionStore,
         session_manager: SessionManager | None = None,
-        timer_service=None,
         send_message_fn: Callable[..., Coroutine[Any, Any, object]] | None = None,
         edit_message_fn: Callable[..., Coroutine[Any, Any, object]] | None = None,
         edit_markup_fn: Callable[..., Coroutine[Any, Any, object]] | None = None,
         bot_username: str = "guessJobot",
     ) -> None:
         self._store = store
-        self.timer_service = timer_service
-        self.session_manager = session_manager or SessionManager(store, timer_service=timer_service)
+        self.session_manager = session_manager or SessionManager(store)
         self._send_message_fn = send_message_fn
         self._edit_message_fn = edit_message_fn
         self._edit_markup_fn = edit_markup_fn
@@ -269,23 +267,44 @@ class TelegramAdapter:
         return self.session_manager.build_status_panel_notification(group_chat_id, header)
 
     async def handle_refresh_panel(self, group_chat_id: int) -> OperationResult:
-        """Resend the current control panel at the bottom of the chat."""
+        """Resend the control panel at the bottom of the chat.
+
+        Always succeeds and always sends a keyboard, including when no session
+        exists. Returning a bare rejection here would defeat the point of the
+        persistent menu: the button that exists to recover a lost panel must
+        never itself be a dead end.
+        """
         async with self._store.lock_for(group_chat_id):
             session = self._store.get(group_chat_id)
-            if session is None:
-                return OperationResult(
-                    ok=False,
-                    reason="no_session",
-                    alert_text="⚠️ لا توجد لعبة نشطة في هذه المجموعة.",
-                    show_alert=True,
-                )
             notif = self._build_status_panel_notification(
                 group_chat_id, "📌 <b>لوحة التحكم الحالية للعبة:</b>"
             )
-            notif.disable_previous_message_id = session.control_message_id
+            notif.disable_previous_message_id = (
+                session.control_message_id if session is not None else None
+            )
             notif.edit_message_id = None
         await self.dispatch_notifications([notif])
-        return OperationResult(ok=True, alert_text="📌 تم إظهار اللوحة بالأسفل!", show_alert=False)
+        return OperationResult(ok=True, show_alert=False)
+
+    async def handle_close_ballot(self, group_chat_id: int, actor_id: int) -> OperationResult:
+        """Tally an open ballot early at the host's request."""
+        async with self._store.lock_for(group_chat_id):
+            res = self.session_manager.close_ballot(group_chat_id, actor_id)
+        if res.notifications:
+            await self.dispatch_notifications(res.notifications)
+        return res
+
+    async def handle_end_round(self, group_chat_id: int, actor_id: int) -> OperationResult:
+        """End the round with no verdict and disclose the spy (host only)."""
+        async with self._store.lock_for(group_chat_id):
+            res = self.session_manager.enter_reveal(group_chat_id, actor_id)
+        if res.notifications:
+            await self.dispatch_notifications(res.notifications)
+        return res
+
+    async def handle_game_menu(self, group_chat_id: int) -> OperationResult:
+        """Re-send the panel for the current state; always available."""
+        return await self.handle_refresh_panel(group_chat_id)
 
     def mark_user_dm_ready(self, user_id: int) -> None:
         """Mark user as DM ready."""

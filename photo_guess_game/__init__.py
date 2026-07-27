@@ -8,7 +8,6 @@ Layering, innermost first:
 ``session_manager`` the rules engine. Every method is synchronous and returns
                     an ``OperationResult`` describing what should be sent; it
                     never performs I/O itself.
-``timer_service``   generation-bound timer registry over an injected scheduler.
 ``telegram_adapter``the I/O boundary. Runs a decision under the group lock,
                     then performs every network send outside the lock.
 ``telegram_api``    stdlib-only Bot API client (no third-party dependencies).

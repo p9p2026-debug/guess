@@ -6,24 +6,27 @@ import html
 import random
 import time
 import uuid
-from typing import Callable
-
 from .locations import LocationEntry, get_location_options, get_random_location
-from .models import (
-    GameSession,
-    GameState,
-    Notification,
-    OperationResult,
-    Player,
-    RoundPhase,
-)
+from .models import GameSession, GameState, Notification, OperationResult, Player
 from .session_store import SessionStore, _NON_TERMINAL_STATES
 
-MIN_PLAYERS_TO_START = 2
+# A round is decided by voting, never by a clock. Three players is therefore the
+# real minimum: it is also MIN_PLAYERS_TO_VOTE, and a two-player round could
+# previously start but never open a ballot, leaving it unfinishable. Two players
+# is meaningless anyway, since the single citizen knows who the spy is.
+MIN_PLAYERS_TO_START = 3
 MIN_PLAYERS_TO_VOTE = 3
 MAX_PLAYERS = 15
-DEFAULT_TIMEOUT_SECONDS = 300
 SPY_GUESS_OPTION_COUNT = 4
+
+#: Appended to every keyboard the bot ever sends, in every state including
+#: terminal ones. These two buttons are the guaranteed escape hatch: whatever
+#: else happens, the group can always reach a menu and rebuild the panel, so no
+#: message can leave the chat with nothing to press.
+PERSISTENT_MENU_ROW = [
+    {"text": "🏠 القائمة الرئيسية", "callback_data": "main_menu"},
+    {"text": "🎮 قائمة اللعبة", "callback_data": "game_menu"},
+]
 
 LOBBY_BUTTONS = [
     [
@@ -34,7 +37,6 @@ LOBBY_BUTTONS = [
         {"text": "🚀 بدء اللعبة", "callback_data": "start_game"},
         {"text": "❌ إلغاء اللعبة", "callback_data": "cancel_game"},
     ],
-    [{"text": "📌 أظهر لوحة الأزرار بالأسفل", "callback_data": "refresh_panel"}],
 ]
 
 # The spy's guess button deliberately does NOT live here.  ``build_spy_guess_menu``
@@ -44,30 +46,30 @@ LOBBY_BUTTONS = [
 # spy-exposed message instead, which is the only moment it can work.
 ACTIVE_PANEL_BUTTONS = [
     [{"text": "🗳️ بدء التصويت على الجاسوس", "callback_data": "start_voting"}],
-    [{"text": "📌 أظهر لوحة الأزرار بالأسفل", "callback_data": "refresh_panel"}],
+    [{"text": "🏁 إنهاء الجولة وكشف الجاسوس", "callback_data": "end_round"}],
+]
+
+#: Shown while a ballot is open, under the candidate buttons. Without this the
+#: round would stall forever whenever one player simply never votes, since a
+#: tally used to require every active player.
+BALLOT_CONTROL_BUTTONS = [
+    [{"text": "🔒 إغلاق التصويت وفرز الأصوات", "callback_data": "close_ballot"}],
 ]
 
 SPY_GUESS_BUTTONS = [
     [{"text": "💡 تخمين الكلمة السرية (الجاسوس)", "callback_data": "spy_guess_menu"}],
 ]
 
+TERMINAL_BUTTONS: list[list[dict[str, str]]] = [
+    [{"text": "🔄 لعبة جديدة", "callback_data": "new_game"}],
+]
+
 
 class SessionManager:
     """Core state machine and rules engine for Spy Game."""
 
-    def __init__(
-        self,
-        store: SessionStore,
-        timer_service=None,
-        on_notification_cb: Callable[[list[Notification]], None] | None = None,
-        timeout_dispatcher: Callable[[str, int], None] | None = None,
-        round_seconds: int = DEFAULT_TIMEOUT_SECONDS,
-    ) -> None:
+    def __init__(self, store: SessionStore) -> None:
         self._store = store
-        self._timer_service = timer_service
-        self._on_notification_cb = on_notification_cb
-        self._timeout_dispatcher = timeout_dispatcher
-        self._round_seconds = round_seconds
 
     @staticmethod
     def generate_game_id() -> str:
@@ -110,7 +112,6 @@ class SessionManager:
             min_players=MIN_PLAYERS_TO_START,
             max_players=MAX_PLAYERS,
             generation=self._store.next_generation(group_chat_id),
-            guessing_timeout_seconds=self._round_seconds,
         )
         self._store.put(session)
 
@@ -130,7 +131,7 @@ class SessionManager:
                 "2️⃣ اضغط <b>🚀 بدء اللعبة</b> للتصويت وتلقي الكلمات السرية بالخاص!\n\n"
                 f"👥 <b>اللوبي مفتوح الآن:</b> ({len(session.players)}/{session.max_players} لاعبين)"
             ),
-            buttons=[list(row) for row in LOBBY_BUTTONS],
+            buttons=self._panel_buttons(session),
         )
         return OperationResult(ok=True, notifications=[announcement], session=session)
 
@@ -179,7 +180,7 @@ class SessionManager:
                 f"👤 <b>{clean_name}</b> انضم للعبة! "
                 f"({len(session.players)}/{session.max_players} لاعبين)"
             ),
-            buttons=[list(row) for row in LOBBY_BUTTONS],
+            buttons=self._panel_buttons(session),
             edit_message_id=session.control_message_id,
         )
         return OperationResult(ok=True, notifications=[notif], session=session)
@@ -216,7 +217,7 @@ class SessionManager:
                 channel="group",
                 target_id=group_chat_id,
                 text=f"🚪 {departing.display_name} غادر اللعبة ولم يبقَ أي لاعب — تم إلغاء اللعبة.",
-                buttons=[list(row) for row in LOBBY_BUTTONS],
+                buttons=self._panel_buttons(session),
             )
             return OperationResult(ok=True, notifications=[notif], session=session)
 
@@ -244,7 +245,7 @@ class SessionManager:
             channel="group",
             target_id=group_chat_id,
             text=text,
-            buttons=[list(row) for row in LOBBY_BUTTONS],
+            buttons=self._panel_buttons(session),
             edit_message_id=session.control_message_id,
         )
         return OperationResult(ok=True, notifications=[notif], session=session)
@@ -322,7 +323,7 @@ class SessionManager:
             ),
             # This message told players to press a button "أدناه" while carrying
             # no keyboard at all, so a started round had no reachable panel.
-            buttons=[list(row) for row in ACTIVE_PANEL_BUTTONS],
+            buttons=self._panel_buttons(session),
             # Sent as a new message (not an edit) so the panel sits at the
             # bottom of the chat, and the now-obsolete lobby keyboard above it
             # is stripped rather than left clickable.
@@ -363,69 +364,8 @@ class SessionManager:
                 )
 
         self._store.put(session)
-        self._schedule_round_timers(session)
 
         return OperationResult(ok=True, notifications=notifications, session=session)
-
-    def _schedule_round_timers(self, session: GameSession) -> None:
-        """Arm the half-time reminder and the round deadline for this generation.
-
-        Uses the generation-bound ``schedule`` API rather than the legacy
-        ``start(group_chat_id, ...)`` helper.  The legacy helper hardcoded
-        generation ``0``, which no real session ever has, so any deployment that
-        wired ``session_lookup`` would have had every timer silently rejected.
-
-        ``expected_revision`` is deliberately left unset: the store bumps the
-        revision on every commit, so pinning it would let an ordinary vote
-        cancel the round deadline.
-        """
-        if self._timer_service is None:
-            return
-
-        key = session.session_key
-        timeout = session.guessing_timeout_seconds
-        if timeout <= 0:
-            self._fire_timeout("expired", session.group_chat_id)
-            return
-
-        self._timer_service.schedule(
-            key,
-            "half_elapsed",
-            f"{session.game_id}-r{session.round_number}-half",
-            timeout / 2,
-            lambda event: self._fire_timeout(
-                "half_elapsed", event.session_key.group_chat_id
-            ),
-            # Skipped automatically once a ballot or the spy's guess is open,
-            # where a "hurry up and vote" nudge would be noise.
-            expected_phase=RoundPhase.DISCUSSION,
-        )
-        self._timer_service.schedule(
-            key,
-            "expired",
-            f"{session.game_id}-r{session.round_number}-expired",
-            timeout,
-            lambda event: self._fire_timeout(
-                "expired", event.session_key.group_chat_id
-            ),
-        )
-
-    def _fire_timeout(self, kind: str, group_chat_id: int) -> None:
-        """Hand a fired timer to the injected dispatcher, or resolve inline.
-
-        Timer callbacks run synchronously in the event loop, so mutating a
-        session directly from one can interleave with a handler that is holding
-        the group lock across an ``await``.  When a dispatcher is injected the
-        work is re-entered asynchronously under that lock instead.  The inline
-        branch keeps the component usable in synchronous tests.
-        """
-        if self._timeout_dispatcher is not None:
-            self._timeout_dispatcher(kind, group_chat_id)
-            return
-        if kind == "half_elapsed":
-            self._on_half_elapsed(group_chat_id)
-        else:
-            self._on_expired(group_chat_id)
 
     def rollback_failed_start(
         self, group_chat_id: int, failed_user_ids: list[int], bot_username: str = "guessJobot"
@@ -440,8 +380,6 @@ class SessionManager:
         if session is None or session.state != GameState.GUESSING:
             return OperationResult(ok=False, reason="not_in_guessing", session=session)
 
-        if self._timer_service is not None:
-            self._timer_service.cancel(group_chat_id)
 
         for uid in failed_user_ids:
             if uid in session.players:
@@ -474,7 +412,7 @@ class SessionManager:
                 f"👉 <b>{failed_names}</b>\n\n"
                 "تمت إعادة اللعبة للوبي. يرجى تفعيل الخاص مع البوت ومحاولة البدء مجدداً."
             ),
-            buttons=[list(row) for row in LOBBY_BUTTONS],
+            buttons=self._panel_buttons(session),
             edit_message_id=session.control_message_id,
         )
         self._store.put(session)
@@ -557,6 +495,17 @@ class SessionManager:
                 session=session,
             )
 
+        if target_id == voter_id:
+            # Accusing yourself is not a move; allowing it also let the spy
+            # bury a vote harmlessly instead of having to accuse someone.
+            return OperationResult(
+                ok=False,
+                reason="self_vote",
+                alert_text="⚠️ لا يمكنك التصويت على نفسك! اختر لاعباً آخر.",
+                show_alert=True,
+                session=session,
+            )
+
         if voter_id in session.votes:
             return OperationResult(
                 ok=False,
@@ -589,6 +538,55 @@ class SessionManager:
             )
 
         # Everyone active has voted -> tally.
+        return self._resolve_ballot(session, active_players)
+
+    def close_ballot(self, group_chat_id: int, actor_id: int) -> OperationResult:
+        """Tally an open ballot early using the votes already cast (host only).
+
+        A tally previously required every active player, so a single player who
+        never voted stalled the round indefinitely.  With no round clock, this
+        is the only way out other than cancelling the game.
+        """
+        session = self._store.get(group_chat_id)
+        if session is None or session.state != GameState.GUESSING or not session.voting_active:
+            return OperationResult(
+                ok=False,
+                reason="voting_not_open",
+                alert_text="⚠️ لا يوجد تصويت مفتوح لإغلاقه.",
+                show_alert=True,
+                session=session,
+            )
+
+        if actor_id != session.host_id:
+            return OperationResult(
+                ok=False,
+                reason="not_host",
+                alert_text="⚠️ فقط منشئ اللعبة يمكنه إغلاق التصويت.",
+                show_alert=True,
+                session=session,
+            )
+
+        if not session.votes:
+            return OperationResult(
+                ok=False,
+                reason="no_votes",
+                alert_text="⚠️ لم يصوّت أحد بعد! لا يمكن الفرز.",
+                show_alert=True,
+                session=session,
+            )
+
+        active_players = [p for p in session.players.values() if p.active]
+        return self._resolve_ballot(session, active_players)
+
+    def _resolve_ballot(
+        self, session: GameSession, active_players: list[Player]
+    ) -> OperationResult:
+        """Count the cast votes and apply the outcome.
+
+        Shared by the final vote and by an early host close, so both paths
+        resolve a round through identical rules.
+        """
+        total_active = len(active_players)
         tally: dict[int, int] = {}
         for tid in session.votes.values():
             tally[tid] = tally.get(tid, 0) + 1
@@ -646,8 +644,6 @@ class SessionManager:
         spy_name = spy_player.display_name if spy_player else "الجاسوس"
         secret_name = session.secret_location_name
         session.state = GameState.COMPLETED
-        if self._timer_service is not None:
-            self._timer_service.cancel(group_chat_id)
         self._store.put(session)
         # Terminal: _panel_buttons returns None here, which is the one case
         # where dropping the keyboard is correct.
@@ -704,8 +700,6 @@ class SessionManager:
         session.spy_guess_attempted = True
         session.spy_guessing_active = False
         session.state = GameState.COMPLETED
-        if self._timer_service is not None:
-            self._timer_service.cancel(group_chat_id)
 
         spy_player = session.players.get(session.spy_user_id)
         spy_name = spy_player.display_name if spy_player else "الجاسوس"
@@ -727,12 +721,7 @@ class SessionManager:
             )
 
         self._store.put(session)
-        notif = Notification(
-            channel="group",
-            target_id=group_chat_id,
-            text=text,
-            edit_message_id=session.control_message_id,
-        )
+        notif = self._panel_update(session, text)
         return OperationResult(ok=True, notifications=[notif], session=session)
 
     # ------------------------------------------------------------------
@@ -759,8 +748,6 @@ class SessionManager:
                 session=session,
             )
 
-        if self._timer_service is not None:
-            self._timer_service.cancel(group_chat_id)
 
         host_name = session.players[session.host_id].display_name
         self._scrub_terminal(session, GameState.CANCELLED)
@@ -776,40 +763,34 @@ class SessionManager:
     # ------------------------------------------------------------------
     # Timeout / reveal
     # ------------------------------------------------------------------
-    def half_time_reminder(self, group_chat_id: int) -> OperationResult:
-        """Build the half-time nudge without mutating the session."""
-        session = self._store.get(group_chat_id)
-        if session is None or session.state != GameState.GUESSING:
-            return OperationResult(ok=False, reason="not_in_guessing", session=session)
-        notif = Notification(
-            channel="group",
-            target_id=group_chat_id,
-            text="⏳ <b>تذكير: نصف الوقت مضى!</b> سارعوا بالنقاش والتصويت.",
-        )
-        return OperationResult(ok=True, notifications=[notif], session=session)
+    def enter_reveal(self, group_chat_id: int, actor_id: int | None = None) -> OperationResult:
+        """End a round without a verdict: disclose everything, spy takes it.
 
-    def _on_half_elapsed(self, group_chat_id: int) -> OperationResult:
-        res = self.half_time_reminder(group_chat_id)
-        if res.ok and self._on_notification_cb is not None:
-            self._on_notification_cb(res.notifications)
-        return res
+        This replaces the round clock, which was removed. The host ends the
+        round explicitly when the group gives up on catching the spy. Passing
+        ``actor_id=None`` skips the host check for internal callers.
 
-    def _on_expired(self, group_chat_id: int) -> OperationResult:
-        res = self.enter_reveal(group_chat_id)
-        if res.ok and self._on_notification_cb is not None:
-            self._on_notification_cb(res.notifications)
-        return res
-
-    def enter_reveal(self, group_chat_id: int) -> OperationResult:
-        """Resolve a GUESSING round whose discussion timer expired.
-
-        Nobody exposed the spy before the deadline, so the spy takes the round.
-        The spy's identity and the secret location are disclosed before the
-        session is scrubbed, because scrubbing clears both.
+        The spy and location are read before ``_scrub_terminal``, which erases
+        both.
         """
         session = self._store.get(group_chat_id)
         if session is None or session.state != GameState.GUESSING:
-            return OperationResult(ok=False, reason="not_in_guessing", session=session)
+            return OperationResult(
+                ok=False,
+                reason="not_in_guessing",
+                alert_text="⚠️ لا توجد جولة نشطة لإنهائها.",
+                show_alert=True,
+                session=session,
+            )
+
+        if actor_id is not None and actor_id != session.host_id:
+            return OperationResult(
+                ok=False,
+                reason="not_host",
+                alert_text="⚠️ فقط منشئ اللعبة يمكنه إنهاء الجولة.",
+                show_alert=True,
+                session=session,
+            )
 
         session.state = GameState.REVEAL
 
@@ -821,23 +802,23 @@ class SessionManager:
         spy_name = spy_player.display_name if spy_player is not None else "الجاسوس"
         secret_name = session.secret_location_name or "غير معروف"
 
-        if self._timer_service is not None:
-            self._timer_service.cancel(group_chat_id)
 
         notif = Notification(
             channel="group",
             target_id=group_chat_id,
             text=(
-                "⏰ <b>انتهى الوقت ولم يُكشف الجاسوس!</b>\n\n"
+                "🏁 <b>انتهت الجولة ولم يُكشف الجاسوس!</b>\n\n"
                 f"🕵️ الجاسوس كان: <b>{spy_name}</b>\n"
                 f"📍 المكان السري كان: <b>{secret_name}</b>\n\n"
                 "🏆 <b>فاز الجاسوس بالجولة! 🕵️🎉</b>"
             ),
-            edit_message_id=session.control_message_id,
         )
 
         self._scrub_terminal(session, GameState.COMPLETED)
         self._store.put(session)
+        # Rebuilt after scrubbing so the keyboard reflects the terminal state.
+        notif.buttons = self._panel_buttons(session)
+        notif.edit_message_id = session.control_message_id
         return OperationResult(ok=True, notifications=[notif], session=session)
 
     # ------------------------------------------------------------------
@@ -897,6 +878,7 @@ class SessionManager:
                 row = []
         if row:
             buttons.append(row)
+        buttons.append(list(PERSISTENT_MENU_ROW))
 
         notif = Notification(
             channel="group",
@@ -934,7 +916,12 @@ class SessionManager:
             return Notification(
                 channel="group",
                 target_id=group_chat_id,
-                text=f"{header}\n\n⚠️ لا توجد لعبة نشطة في هذه المجموعة.",
+                text=(
+                    f"{header}\n\n"
+                    "⚠️ لا توجد لعبة نشطة في هذه المجموعة.\n"
+                    "اضغط <b>🔄 لعبة جديدة</b> للبدء."
+                ),
+                buttons=self._panel_buttons(None),
             )
 
         if session.state is GameState.LOBBY:
@@ -961,26 +948,33 @@ class SessionManager:
             buttons=self._panel_buttons(session),
         )
 
-    def _panel_buttons(self, session: GameSession) -> list[list[dict[str, str]]] | None:
-        """Return the keyboard that matches the session's current state.
+    def _panel_buttons(self, session: GameSession | None) -> list[list[dict[str, str]]]:
+        """Return the keyboard matching the current state, never empty.
 
-        Every notification that edits the control panel must pass its result
-        through here.  Editing a message without ``reply_markup`` strips its
-        keyboard permanently, which previously left the group with no way to
-        act and the round unfinishable.
+        Every group notification passes its keyboard through here. Two rules are
+        enforced structurally rather than per call site:
+
+        * A keyboard is never ``None``. Editing a Telegram message without
+          ``reply_markup`` deletes its keyboard permanently, which is what made
+          buttons "disappear forever" and left rounds unfinishable.
+        * ``PERSISTENT_MENU_ROW`` is always appended, including on terminal
+          sessions, so there is always something to press.
         """
-        if session.terminal:
-            return None
-        if session.state is GameState.LOBBY:
-            return [list(row) for row in LOBBY_BUTTONS]
-        if session.state is GameState.GUESSING:
-            if session.spy_guessing_active:
-                return [list(row) for row in SPY_GUESS_BUTTONS]
-            if session.voting_active:
-                active_players = [p for p in session.players.values() if p.active]
-                return self._build_vote_buttons(active_players)
-            return [list(row) for row in ACTIVE_PANEL_BUTTONS]
-        return [list(row) for row in ACTIVE_PANEL_BUTTONS]
+        if session is None or session.terminal:
+            rows = [list(row) for row in TERMINAL_BUTTONS]
+        elif session.state is GameState.LOBBY:
+            rows = [list(row) for row in LOBBY_BUTTONS]
+        elif session.spy_guessing_active:
+            rows = [list(row) for row in SPY_GUESS_BUTTONS]
+        elif session.voting_active:
+            active_players = [p for p in session.players.values() if p.active]
+            rows = self._build_vote_buttons(active_players)
+            rows += [list(row) for row in BALLOT_CONTROL_BUTTONS]
+        else:
+            rows = [list(row) for row in ACTIVE_PANEL_BUTTONS]
+
+        rows.append(list(PERSISTENT_MENU_ROW))
+        return rows
 
     def _panel_update(self, session: GameSession, text: str) -> Notification:
         """Build an in-place panel edit that always carries a live keyboard."""

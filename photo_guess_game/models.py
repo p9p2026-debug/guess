@@ -15,16 +15,6 @@ class SessionKey:
     generation: int
 
 
-class RoundPhase(Enum):
-    """Explicit round sub-phases used by generation-bound components."""
-
-    LOBBY = "lobby"
-    DELIVERING = "delivering"
-    DISCUSSION = "discussion"
-    VOTING = "voting"
-    SPY_GUESS = "spy_guess"
-
-
 class GameState(Enum):
     """Explicit state machine states for GameSession.
 
@@ -50,17 +40,6 @@ class GameState(Enum):
 TERMINAL_STATES: frozenset[GameState] = frozenset(
     {GameState.COMPLETED, GameState.CANCELLED}
 )
-
-#: GameState -> RoundPhase projection used by generation-bound timer guards.
-#: ``GUESSING`` is refined at runtime via the voting/spy sub-flags.
-_PHASE_BY_STATE: dict[GameState, RoundPhase] = {
-    GameState.LOBBY: RoundPhase.LOBBY,
-    GameState.DEALING: RoundPhase.DELIVERING,
-    GameState.GUESSING: RoundPhase.DISCUSSION,
-    GameState.DISCUSSION: RoundPhase.DISCUSSION,
-    GameState.VOTING: RoundPhase.VOTING,
-    GameState.SPY_LAST_GUESS: RoundPhase.SPY_GUESS,
-}
 
 
 @dataclass
@@ -104,15 +83,13 @@ class GameSession:
     spy_guess_attempted: bool = False
     voting_active: bool = False
     spy_guessing_active: bool = False
-    guessing_timeout_seconds: int = 300
-    min_players: int = 2
+    min_players: int = 3
     max_players: int = 15
     #: Monotonic generation for this group chat.  A new session in the same
     #: group always gets a higher generation, so timers and callbacks issued by
     #: a previous game can be rejected instead of mutating the new one.
     generation: int = 1
-    #: Bumped on every committed state change; lets a timer scheduled before a
-    #: transition detect that it is stale.
+    #: Bumped on every committed state change; a cheap audit counter.
     revision: int = 0
 
     @property
@@ -124,17 +101,6 @@ class GameSession:
     def terminal(self) -> bool:
         """Whether this session accepts no further transitions."""
         return self.state in TERMINAL_STATES
-
-    @property
-    def phase(self) -> RoundPhase | None:
-        """Current round sub-phase, or ``None`` once terminal/revealing."""
-        if self.state is GameState.GUESSING:
-            if self.spy_guessing_active:
-                return RoundPhase.SPY_GUESS
-            if self.voting_active:
-                return RoundPhase.VOTING
-            return RoundPhase.DISCUSSION
-        return _PHASE_BY_STATE.get(self.state)
 
     def touch(self) -> int:
         """Bump and return the revision counter after a committed change."""

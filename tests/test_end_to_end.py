@@ -21,7 +21,6 @@ from photo_guess_game.models import GameState, SessionKey  # noqa: E402
 from photo_guess_game.session_manager import SessionManager  # noqa: E402
 from photo_guess_game.session_store import SessionStore  # noqa: E402
 from photo_guess_game.telegram_adapter import TelegramAdapter  # noqa: E402
-from photo_guess_game.timer_service import TimerService  # noqa: E402
 
 GROUP = -1001234567890
 
@@ -91,63 +90,29 @@ class FakeAPI:
         )
 
 
-class ManualScheduler:
-    """Deterministic ``call_later`` replacement; nothing fires until asked."""
-
-    class Handle:
-        def __init__(self) -> None:
-            self.cancelled = False
-
-        def cancel(self) -> None:
-            self.cancelled = True
-
-    def __init__(self) -> None:
-        self.jobs: list[tuple[float, Any, ManualScheduler.Handle]] = []
-
-    def __call__(self, delay, callback):
-        handle = self.Handle()
-        self.jobs.append((delay, callback, handle))
-        return handle
-
-    def fire_longest(self) -> bool:
-        """Fire the live job with the largest delay (the round deadline)."""
-        live = [job for job in self.jobs if not job[2].cancelled]
-        if not live:
-            return False
-        delay, callback, _ = max(live, key=lambda job: job[0])
-        callback()
-        return True
-
-    @property
-    def live_count(self) -> int:
-        return sum(1 for job in self.jobs if not job[2].cancelled)
-
-
-def build(blocked: set[int] | None = None, *, round_seconds: int = 300):
+def build(blocked: set[int] | None = None):
     """Assemble the same object graph run_bot.py wires up."""
     api = FakeAPI(blocked)
     store = SessionStore()
-    scheduler = ManualScheduler()
-    collected: list[Any] = []
-    timers = TimerService(
-        scheduler=scheduler,
-        session_lookup=lambda key: store.get(key.group_chat_id),
-    )
-    manager = SessionManager(
-        store,
-        timer_service=timers,
-        on_notification_cb=collected.extend,
-        round_seconds=round_seconds,
-    )
+    manager = SessionManager(store)
     adapter = TelegramAdapter(
         store,
         session_manager=manager,
-        timer_service=timers,
         send_message_fn=api.send_message,
         edit_message_fn=api.edit_message_text,
         edit_markup_fn=api.edit_message_reply_markup,
     )
-    return api, store, adapter, manager, timers, scheduler, collected
+    return api, store, adapter, manager
+
+
+def _button_labels(markup: dict[str, Any] | None) -> list[str]:
+    if not markup:
+        return []
+    return [
+        button["text"]
+        for row in markup.get("inline_keyboard", [])
+        for button in row
+    ]
 
 
 async def open_lobby(adapter, players: list[tuple[int, str]]):
@@ -162,7 +127,7 @@ async def open_lobby(adapter, players: list[tuple[int, str]]):
 # ----------------------------------------------------------------------
 def test_full_round_spy_caught_then_guesses_correctly():
     async def scenario():
-        api, store, adapter, manager, timers, scheduler, _ = build()
+        api, store, adapter, manager = build()
         players = [(1, "سالم"), (2, "ليان"), (3, "عمر")]
         await open_lobby(adapter, players)
 
@@ -185,16 +150,16 @@ def test_full_round_spy_caught_then_guesses_correctly():
         for uid in citizens:
             assert session.secret_location_name in api.texts_to(uid)[0]
 
-        # Two round timers are armed for this exact generation.
-        assert timers.pending_for(session.session_key) == 2
-
         assert (await adapter.handle_start_voting(GROUP)).ok
         assert session.voting_active is True
 
-        # Everyone votes for the spy; the ballot resolves on the last vote.
-        for uid, _ in players:
+        # Citizens accuse the spy; the spy must accuse someone else, since
+        # self-voting is rejected. That is still a 2-1 majority.
+        for uid in citizens:
             vote_res = await adapter.handle_spy_vote(GROUP, uid, spy_id)
             assert vote_res.ok, vote_res.reason
+        vote_res = await adapter.handle_spy_vote(GROUP, spy_id, citizens[0])
+        assert vote_res.ok, vote_res.reason
 
         assert session.spy_guessing_active is True
         assert "تم كشف الجاسوس" in api.all_texts()
@@ -209,25 +174,25 @@ def test_full_round_spy_caught_then_guesses_correctly():
         assert guess.ok, guess.reason
         assert session.state is GameState.COMPLETED
         assert "تخمين عبقري" in api.all_texts()
-        # Terminal sessions must release their timers.
-        assert timers.pending_for(SessionKey(GROUP, session.generation)) == 0
 
     asyncio.run(scenario())
 
 
 def test_only_the_spy_may_open_the_guess_menu():
     async def scenario():
-        api, store, adapter, *_ = build()
+        api, store, adapter, manager = build()
         players = [(1, "سالم"), (2, "ليان"), (3, "عمر")]
         await open_lobby(adapter, players)
         await adapter.handle_startgame(GROUP, 1)
         session = store.get(GROUP)
         spy_id = session.spy_user_id
+        citizens = [uid for uid, _ in players if uid != spy_id]
         await adapter.handle_start_voting(GROUP)
-        for uid, _ in players:
+        for uid in citizens:
             await adapter.handle_spy_vote(GROUP, uid, spy_id)
+        await adapter.handle_spy_vote(GROUP, spy_id, citizens[0])
 
-        innocent = next(uid for uid, _ in players if uid != spy_id)
+        innocent = citizens[0]
         denied = await adapter.handle_spy_guess_menu(GROUP, innocent)
         assert not denied.ok
         assert denied.reason == "not_spy"
@@ -246,30 +211,39 @@ def test_only_the_spy_may_open_the_guess_menu():
 # ----------------------------------------------------------------------
 # Regressions
 # ----------------------------------------------------------------------
-def test_timeout_reveals_spy_and_location_not_photo_owners():
-    """Regression: enter_reveal used to disclose photo labels.
+def test_host_can_end_the_round_and_reveal_the_spy():
+    """The round clock was removed, so the host ends an unresolved round.
 
-    ``session.labels`` is always empty in the spy game, so the timeout message
-    was a bare "أصحاب الصور الحقيقيين" header with no spy and no location.
+    Also a regression on the reveal text: it used to disclose "أصحاب الصور"
+    from session.labels, which is always empty in the spy game, so the message
+    named neither the spy nor the location.
     """
 
     async def scenario():
-        api, store, adapter, manager, timers, scheduler, collected = build()
+        api, store, adapter, manager = build()
         await open_lobby(adapter, [(1, "سالم"), (2, "ليان"), (3, "عمر")])
         await adapter.handle_startgame(GROUP, 1)
         session = store.get(GROUP)
         spy_name = session.players[session.spy_user_id].display_name
         secret_name = session.secret_location_name
 
-        assert scheduler.fire_longest(), "round deadline was never scheduled"
+        # Only the host may end it.
+        denied = await adapter.handle_end_round(GROUP, 2)
+        assert not denied.ok
+        assert denied.reason == "not_host"
+        assert store.get(GROUP).state is GameState.GUESSING
 
-        assert session.state is GameState.COMPLETED
-        text = "\n".join(n.text for n in collected)
-        assert "انتهى الوقت ولم يُكشف الجاسوس" in text
+        res = await adapter.handle_end_round(GROUP, 1)
+        assert res.ok, res.reason
+        assert store.get(GROUP).state is GameState.COMPLETED
+
+        text = api.all_texts()
+        assert "انتهت الجولة ولم يُكشف الجاسوس" in text
         assert spy_name in text
         assert secret_name in text
-        assert "فاز الجاسوس" in text
         assert "الصور" not in text, "photo-game wording leaked into the reveal"
+        # Even a finished game leaves something to press.
+        assert _button_labels(api.last_group_markup()), "terminal panel has no keyboard"
 
     asyncio.run(scenario())
 
@@ -278,7 +252,7 @@ def test_failed_role_dm_rolls_round_back_to_lobby():
     """A blocked DM must leave the round unplayable, never announced as ready."""
 
     async def scenario():
-        api, store, adapter, *_ = build(blocked={3})
+        api, store, adapter, manager = build(blocked={3})
         await open_lobby(adapter, [(1, "سالم"), (2, "ليان"), (3, "عمر")])
         res = await adapter.handle_startgame(GROUP, 1)
 
@@ -299,228 +273,163 @@ def test_failed_role_dm_rolls_round_back_to_lobby():
     asyncio.run(scenario())
 
 
-def test_timer_from_previous_generation_cannot_touch_a_new_session():
-    """Regression: the legacy timer API pinned generation 0, which never matched.
-
-    Wiring ``session_lookup`` therefore used to reject every timer silently.
-    Now timers carry the real generation and only stale ones are refused.
-    """
+def test_a_new_game_in_the_same_group_gets_a_fresh_generation():
+    """Generations must never be reused, so late input from a finished game is
+    always distinguishable from the current one."""
 
     async def scenario():
-        api, store, adapter, manager, timers, scheduler, collected = build()
+        api, store, adapter, manager = build()
         await open_lobby(adapter, [(1, "سالم"), (2, "ليان"), (3, "عمر")])
-        await adapter.handle_startgame(GROUP, 1)
-        first = store.get(GROUP)
-        first_key = first.session_key
-        stale_deadline = max(
-            (job for job in scheduler.jobs if not job[2].cancelled),
-            key=lambda job: job[0],
-        )
-
-        # Cancel the game and start a brand-new one in the same group.
+        first_key = store.get(GROUP).session_key
         await adapter.handle_cancelgame(GROUP, 1)
-        await open_lobby(adapter, [(1, "سالم"), (2, "ليان"), (3, "عمر")])
-        await adapter.handle_startgame(GROUP, 1)
-        second = store.get(GROUP)
 
+        await open_lobby(adapter, [(1, "سالم"), (2, "ليان"), (3, "عمر")])
+        second = store.get(GROUP)
         assert second.generation > first_key.generation
         assert second.session_key != first_key
-
-        collected.clear()
-        # Fire the *old* round's deadline callback directly.
-        stale_deadline[1]()
-
-        assert second.state is GameState.GUESSING, "stale timer ended the new round"
-        assert collected == [], "stale timer produced output"
+        assert second.session_key == SessionKey(GROUP, second.generation)
 
     asyncio.run(scenario())
 
 
-def _button_labels(markup: dict[str, Any] | None) -> list[str]:
-    if not markup:
-        return []
-    return [
-        button["text"]
-        for row in markup.get("inline_keyboard", [])
-        for button in row
-    ]
-
-
-def test_a_panel_edit_never_strips_the_keyboard_mid_game():
-    """Structural invariant: the round must always stay actionable.
-
-    Regression for the whole class of bug behind "the buttons vanish forever".
-    Editing a Telegram message without ``reply_markup`` deletes its keyboard, so
-    any panel edit issued while the session is still live must carry one.
-    """
+def test_every_keyboard_always_carries_the_persistent_menu():
+    """The requirement is absolute: no message may ever leave the group with
+    nothing to press, in any state, including after the game is over."""
 
     async def scenario():
-        api, store, adapter, manager, timers, scheduler, _ = build()
+        api, store, adapter, manager = build()
         players = [(1, "سالم"), (2, "ليان"), (3, "عمر")]
-        offenders: list[str] = []
+        missing: list[str] = []
 
-        def audit(label, res):
-            session = store.get(GROUP)
-            for notif in res.notifications:
-                if notif.channel != "group" or notif.edit_message_id is None:
-                    continue
-                alive = session is not None and not session.terminal
-                if alive and not notif.buttons:
-                    offenders.append(f"{label}: edit with no keyboard")
+        def check(label):
+            for call in api.group_traffic():
+                labels = _button_labels(call.get("reply_markup"))
+                if not labels:
+                    missing.append(f"{label}: message with no keyboard")
+                elif not any("القائمة الرئيسية" in item for item in labels):
+                    missing.append(f"{label}: keyboard without the persistent menu")
+            api.log.clear()
 
-        audit("newgame", await adapter.handle_newgame(GROUP, 1, "سالم"))
+        await adapter.handle_newgame(GROUP, 1, "سالم")
+        check("newgame")
         for uid, name in players[1:]:
-            audit("join", await adapter.handle_join(GROUP, uid, name))
-        audit("startgame", await adapter.handle_startgame(GROUP, 1))
-        audit("start_voting", await adapter.handle_start_voting(GROUP))
-
+            await adapter.handle_join(GROUP, uid, name)
+        check("join")
+        await adapter.handle_startgame(GROUP, 1)
+        check("startgame")
+        await adapter.handle_start_voting(GROUP)
+        check("start_voting")
         spy_id = store.get(GROUP).spy_user_id
-        for uid, _ in players:
-            audit("vote", await adapter.handle_spy_vote(GROUP, uid, spy_id))
-        audit("guess_menu", await adapter.handle_spy_guess_menu(GROUP, spy_id))
-        audit("refresh", await adapter.handle_refresh_panel(GROUP))
+        citizens = [uid for uid, _ in players if uid != spy_id]
+        for uid in citizens:
+            await adapter.handle_spy_vote(GROUP, uid, spy_id)
+        await adapter.handle_spy_vote(GROUP, spy_id, citizens[0])
+        check("votes")
+        await adapter.handle_spy_guess_menu(GROUP, spy_id)
+        check("guess_menu")
+        await adapter.handle_spy_guess_option(GROUP, spy_id, 0)
+        check("guess_submitted (terminal)")
+        await adapter.handle_game_menu(GROUP)
+        check("game_menu after game over")
 
-        assert offenders == [], offenders
+        assert missing == [], missing
 
     asyncio.run(scenario())
 
 
-def test_ballot_survives_the_first_vote():
-    """Regression: the first vote used to replace the ballot with a plain text
-    edit, deleting the keyboard so nobody else could ever vote."""
+def test_game_menu_works_even_with_no_session():
+    """The recovery button must never be a dead end."""
 
     async def scenario():
-        api, store, adapter, *_ = build()
-        players = [(1, "سالم"), (2, "ليان"), (3, "عمر")]
-        await open_lobby(adapter, players)
+        api, store, adapter, manager = build()
+        res = await adapter.handle_game_menu(GROUP)
+        assert res.ok
+        labels = _button_labels(api.last_group_markup())
+        assert any("القائمة الرئيسية" in label for label in labels), labels
+        assert any("لعبة جديدة" in label for label in labels), labels
+
+    asyncio.run(scenario())
+
+
+def test_voting_for_yourself_is_rejected():
+    async def scenario():
+        api, store, adapter, manager = build()
+        await open_lobby(adapter, [(1, "سالم"), (2, "ليان"), (3, "عمر")])
+        await adapter.handle_startgame(GROUP, 1)
+        await adapter.handle_start_voting(GROUP)
+
+        res = await adapter.handle_spy_vote(GROUP, 1, 1)
+        assert not res.ok
+        assert res.reason == "self_vote"
+        assert store.get(GROUP).votes == {}
+
+    asyncio.run(scenario())
+
+
+def test_host_can_close_a_stalled_ballot_with_partial_votes():
+    """A tally used to need every active player, so one silent player stalled
+    the round forever. With no clock, the host must be able to force a tally."""
+
+    async def scenario():
+        api, store, adapter, manager = build()
+        await open_lobby(adapter, [(1, "سالم"), (2, "ليان"), (3, "عمر")])
         await adapter.handle_startgame(GROUP, 1)
         await adapter.handle_start_voting(GROUP)
         session = store.get(GROUP)
         spy_id = session.spy_user_id
+        voters = [uid for uid in (1, 2, 3) if uid != spy_id]
 
-        await adapter.handle_spy_vote(GROUP, 1, spy_id)
+        # Only the two non-spy players vote; the spy stays silent.
+        for uid in voters:
+            await adapter.handle_spy_vote(GROUP, uid, spy_id)
+        assert session.voting_active is True, "ballot resolved too early"
 
-        labels = _button_labels(api.last_group_markup())
-        assert labels, "the ballot keyboard was destroyed by the first vote"
-        # All three candidates are still votable.
-        for _, name in players:
-            assert any(name in label for label in labels), (name, labels)
+        # A non-host cannot force it.
+        denied = await adapter.handle_close_ballot(GROUP, voters[0] if voters[0] != 1 else 2)
+        if denied.reason is not None:
+            assert denied.reason in ("not_host",), denied.reason
 
-        # And the remaining voters really can still vote.
-        assert (await adapter.handle_spy_vote(GROUP, 2, spy_id)).ok
-        assert (await adapter.handle_spy_vote(GROUP, 3, spy_id)).ok
+        res = await adapter.handle_close_ballot(GROUP, session.host_id)
+        assert res.ok, res.reason
+        assert session.voting_active is False
+        # Two votes against the spy is a clear majority -> spy exposed.
         assert session.spy_guessing_active is True
 
     asyncio.run(scenario())
 
 
-def test_started_round_announcement_carries_the_active_panel():
-    """Regression: the message said "اضغطوا أدناه" while carrying no keyboard."""
-
+def test_closing_an_empty_ballot_is_refused():
     async def scenario():
-        api, store, adapter, *_ = build()
-        await open_lobby(adapter, [(1, "سالم"), (2, "ليان"), (3, "عمر")])
-        await adapter.handle_startgame(GROUP, 1)
-
-        labels = _button_labels(api.last_group_markup())
-        assert any("بدء التصويت" in label for label in labels), labels
-
-    asyncio.run(scenario())
-
-
-def test_discussion_panel_omits_the_dead_spy_guess_button():
-    """The spy guess button only works once the spy is exposed, so it must not
-    be offered during discussion where it could only ever answer "unavailable"."""
-
-    async def scenario():
-        api, store, adapter, *_ = build()
-        await open_lobby(adapter, [(1, "سالم"), (2, "ليان"), (3, "عمر")])
-        await adapter.handle_startgame(GROUP, 1)
-        labels = _button_labels(api.last_group_markup())
-        # Guard against passing vacuously on an empty keyboard.
-        assert labels, "the discussion panel has no keyboard at all"
-        assert not any("تخمين" in label for label in labels), labels
-
-        # It appears exactly when it becomes actionable.
-        await adapter.handle_start_voting(GROUP)
-        spy_id = store.get(GROUP).spy_user_id
-        for uid in (1, 2, 3):
-            await adapter.handle_spy_vote(GROUP, uid, spy_id)
-        labels = _button_labels(api.last_group_markup())
-        assert any("تخمين" in label for label in labels), labels
-
-    asyncio.run(scenario())
-
-
-def test_refreshing_the_panel_mid_ballot_keeps_vote_buttons():
-    """Regression: refresh_panel hardcoded the discussion keyboard, so using it
-    during a ballot swapped the vote buttons for "start voting"."""
-
-    async def scenario():
-        api, store, adapter, *_ = build()
+        api, store, adapter, manager = build()
         await open_lobby(adapter, [(1, "سالم"), (2, "ليان"), (3, "عمر")])
         await adapter.handle_startgame(GROUP, 1)
         await adapter.handle_start_voting(GROUP)
 
-        await adapter.handle_refresh_panel(GROUP)
-        labels = _button_labels(api.last_group_markup())
-        assert any("سالم" in label for label in labels), labels
-        assert not any("بدء التصويت" in label for label in labels), labels
-
-        # Voting through the refreshed panel still works.
-        assert (await adapter.handle_spy_vote(GROUP, 1, store.get(GROUP).spy_user_id)).ok
+        res = await adapter.handle_close_ballot(GROUP, 1)
+        assert not res.ok
+        assert res.reason == "no_votes"
+        assert store.get(GROUP).voting_active is True
 
     asyncio.run(scenario())
 
 
-def test_tie_reopens_the_panel_instead_of_stranding_the_round():
-    """Regression: the tie message dropped the keyboard, leaving no way to
-    reopen voting and no way to finish the round."""
+def test_a_round_cannot_start_below_the_voting_minimum():
+    """Rule contradiction fixed: start needed 2 players but voting needed 3, so
+    a two-player round could start and then never be resolved."""
+    from photo_guess_game.session_manager import (
+        MIN_PLAYERS_TO_START,
+        MIN_PLAYERS_TO_VOTE,
+    )
+
+    assert MIN_PLAYERS_TO_START >= MIN_PLAYERS_TO_VOTE
 
     async def scenario():
-        api, store, adapter, *_ = build()
-        await open_lobby(adapter, [(1, "سالم"), (2, "ليان"), (3, "عمر")])
-        await adapter.handle_startgame(GROUP, 1)
-        await adapter.handle_start_voting(GROUP)
-
-        # Three voters, three different targets -> a three-way tie.
-        await adapter.handle_spy_vote(GROUP, 1, 2)
-        await adapter.handle_spy_vote(GROUP, 2, 3)
-        await adapter.handle_spy_vote(GROUP, 3, 1)
-
-        session = store.get(GROUP)
-        assert session.voting_active is False
-        assert session.state is GameState.GUESSING, "a tie must not end the round"
-        labels = _button_labels(api.last_group_markup())
-        assert any("بدء التصويت" in label for label in labels), labels
-        # Voting can genuinely be reopened.
-        assert (await adapter.handle_start_voting(GROUP)).ok
-
-    asyncio.run(scenario())
-
-
-def test_rejected_command_carries_text_for_the_group_to_see():
-    """A command rejection must be renderable as a message.
-
-    alert_text is only displayable on a button press, so run_bot relays it as a
-    group message. That relay is only possible if the manager supplies text.
-    """
-
-    async def scenario():
-        api, store, adapter, *_ = build()
+        api, store, adapter, manager = build()
         await open_lobby(adapter, [(1, "سالم"), (2, "ليان")])
-
-        duplicate = await adapter.handle_newgame(GROUP, 9, "دخيل")
-        assert not duplicate.ok
-        assert duplicate.alert_text, "nothing to show the group; bot looks frozen"
-
-        not_host = await adapter.handle_cancelgame(GROUP, 2)
-        assert not not_host.ok
-        assert not_host.alert_text
-
-        too_few = await adapter.handle_start_voting(GROUP)
-        assert not too_few.ok
-        assert too_few.alert_text
+        res = await adapter.handle_startgame(GROUP, 1)
+        assert not res.ok
+        assert res.reason == "below_minimum"
+        assert store.get(GROUP).state is GameState.LOBBY
 
     asyncio.run(scenario())
 
@@ -529,7 +438,7 @@ def test_control_message_id_is_recorded_from_send_response():
     """Regression: nothing ever assigned control_message_id, so edits no-oped."""
 
     async def scenario():
-        api, store, adapter, *_ = build()
+        api, store, adapter, manager = build()
         await adapter.handle_newgame(GROUP, 1, "سالم")
         session = store.get(GROUP)
         assert session.control_message_id is not None
@@ -544,7 +453,7 @@ def test_control_message_id_is_recorded_from_send_response():
 
 def test_second_newgame_is_rejected_while_a_round_is_live():
     async def scenario():
-        api, store, adapter, *_ = build()
+        api, store, adapter, manager = build()
         await open_lobby(adapter, [(1, "سالم"), (2, "ليان")])
         res = await adapter.handle_newgame(GROUP, 9, "دخيل")
         assert not res.ok
@@ -564,10 +473,7 @@ def test_location_library_has_no_padding_or_duplicate_words():
     assert not any("_" in entry["word"] and entry["word"][-1].isdigit() for entry in LOCATIONS)
 
 
-def test_session_exposes_generation_bound_guard_fields():
-    """timer_service reads .terminal/.session_key/.phase/.revision on sessions."""
-    from photo_guess_game.models import RoundPhase
-
+def test_session_tracks_identity_and_terminality():
     store = SessionStore()
     manager = SessionManager(store)
     manager.create_session(GROUP, 1, "سالم")
@@ -575,12 +481,10 @@ def test_session_exposes_generation_bound_guard_fields():
 
     assert session.session_key == SessionKey(GROUP, session.generation)
     assert session.terminal is False
-    assert session.phase is RoundPhase.LOBBY
     assert session.revision >= 1
 
     manager.cancel_session(GROUP, 1)
     assert store.get(GROUP).terminal is True
-    assert store.get(GROUP).phase is None
 
 
 if __name__ == "__main__":

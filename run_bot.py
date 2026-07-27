@@ -8,8 +8,6 @@ tiny HTTP health endpoint so the process can be hosted as a Render Web Service
 Configuration (environment variables):
     BOT_TOKEN   required. Bot token from @BotFather.
     PORT        optional. Health-check port; Render injects this.
-    ROUND_SECONDS
-                optional. Discussion length in seconds (default 300).
     LOG_LEVEL   optional. Python log level name (default INFO).
 """
 
@@ -33,7 +31,6 @@ from photo_guess_game.telegram_api import (
     LONG_POLL_SECONDS,
     TelegramAPI,
 )
-from photo_guess_game.timer_service import TimerService
 
 logger = logging.getLogger("spygame")
 
@@ -45,6 +42,8 @@ HELP_TEXT = (
     "/panel — إظهار لوحة الأزرار من جديد بأسفل المحادثة\n"
     "/cancel — إلغاء اللعبة الحالية (المنشئ فقط)\n"
     "/help — عرض هذه الرسالة\n\n"
+    "<b>ملاحظة:</b> لا يوجد وقت محدد للجولة. الجولة تنتهي بالتصويت، "
+    "أو بضغط المنشئ <b>🏁 إنهاء الجولة وكشف الجاسوس</b>.\n\n"
     "<b>كيف تلعبون:</b>\n"
     "1️⃣ أضف البوت لمجموعة وأرسل /newgame\n"
     "2️⃣ كل لاعب يضغط <b>➕ انضمام للعبة</b>\n"
@@ -92,9 +91,7 @@ def start_health_server(port: int) -> ThreadingHTTPServer:
 class BotRunner:
     """Wires the game components to the Bot API and pumps the update loop."""
 
-    def __init__(
-        self, api: TelegramAPI, *, round_seconds: int, bot_username: str
-    ) -> None:
+    def __init__(self, api: TelegramAPI, *, bot_username: str) -> None:
         self._api = api
         self._store = SessionStore()
         self._stopping = asyncio.Event()
@@ -102,21 +99,10 @@ class BotRunner:
         # loop is free to garbage-collect a task mid-flight.
         self._background: set[asyncio.Task[Any]] = set()
 
-        loop = asyncio.get_running_loop()
-        self._timers = TimerService(
-            scheduler=lambda delay, callback: loop.call_later(delay, callback),
-            session_lookup=lambda key: self._store.get(key.group_chat_id),
-        )
-        self._manager = SessionManager(
-            self._store,
-            timer_service=self._timers,
-            timeout_dispatcher=self._on_timer_fired,
-            round_seconds=round_seconds,
-        )
+        self._manager = SessionManager(self._store)
         self._adapter = TelegramAdapter(
             self._store,
             session_manager=self._manager,
-            timer_service=self._timers,
             send_message_fn=api.send_message,
             edit_message_fn=api.edit_message_text,
             edit_markup_fn=api.edit_message_reply_markup,
@@ -129,19 +115,6 @@ class BotRunner:
         task = asyncio.create_task(coro)
         self._background.add(task)
         task.add_done_callback(self._background.discard)
-
-    def _on_timer_fired(self, kind: str, group_chat_id: int) -> None:
-        """Bridge a synchronous timer callback into a lock-guarded coroutine."""
-        self._spawn(self._resolve_timeout(kind, group_chat_id))
-
-    async def _resolve_timeout(self, kind: str, group_chat_id: int) -> None:
-        async with self._store.lock_for(group_chat_id):
-            if kind == "half_elapsed":
-                res = self._manager.half_time_reminder(group_chat_id)
-            else:
-                res = self._manager.enter_reveal(group_chat_id)
-        if res.ok and res.notifications:
-            await self._adapter.dispatch_notifications(res.notifications)
 
     # -- routing -------------------------------------------------------
     @staticmethod
@@ -222,8 +195,19 @@ class BotRunner:
                 res = await self._adapter.handle_startgame(chat_id, user_id)
             elif data == "cancel_game":
                 res = await self._adapter.handle_cancelgame(chat_id, user_id)
-            elif data == "refresh_panel":
-                res = await self._adapter.handle_refresh_panel(chat_id)
+            elif data in ("refresh_panel", "game_menu"):
+                res = await self._adapter.handle_game_menu(chat_id)
+            elif data == "main_menu":
+                await self._api.send_message(chat_id, HELP_TEXT)
+                res = None
+            elif data in ("new_game", "new_game_button"):
+                res = await self._adapter.handle_newgame(
+                    chat_id, user_id, display_name
+                )
+            elif data == "close_ballot":
+                res = await self._adapter.handle_close_ballot(chat_id, user_id)
+            elif data == "end_round":
+                res = await self._adapter.handle_end_round(chat_id, user_id)
             elif data == "start_voting":
                 res = await self._adapter.handle_start_voting(chat_id)
             elif data == "spy_guess_menu":
@@ -294,9 +278,7 @@ class BotRunner:
         self._stopping.set()
 
     async def shutdown(self) -> None:
-        """Release timers and let in-flight handlers finish."""
-        cancelled = self._timers.shutdown()
-        logger.info("cancelled %d pending timer(s)", cancelled)
+        """Let in-flight handlers finish."""
         if self._background:
             await asyncio.wait(set(self._background), timeout=10)
 
@@ -327,7 +309,6 @@ async def _amain() -> int:
     )
 
     token = _read_token()
-    round_seconds = int(os.environ.get("ROUND_SECONDS", "300"))
 
     # Overridable so the boot path can be exercised against a local stub in
     # tests; production never sets it.
@@ -348,7 +329,7 @@ async def _amain() -> int:
     # Long polling and a webhook are mutually exclusive; clear any stale one.
     await api.delete_webhook()
 
-    runner = BotRunner(api, round_seconds=round_seconds, bot_username=username)
+    runner = BotRunner(api, bot_username=username)
 
     port_value = os.environ.get("PORT")
     health_server = start_health_server(int(port_value)) if port_value else None
@@ -360,7 +341,7 @@ async def _amain() -> int:
         except NotImplementedError:
             signal.signal(sig, lambda _sig, _frame: runner.request_stop())
 
-    logger.info("polling started (round length %ds)", round_seconds)
+    logger.info("polling started")
     try:
         await runner.run()
     finally:

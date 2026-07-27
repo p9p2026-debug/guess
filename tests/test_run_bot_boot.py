@@ -78,6 +78,10 @@ def test_boots_polls_routes_updates_and_stops_cleanly():
                 "LOG_LEVEL": "INFO",
             }
         )
+        kwargs = {}
+        if sys.platform == "win32":
+            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+
         bot = subprocess.Popen(
             [PYTHON, "run_bot.py"],
             cwd=ROOT,
@@ -85,6 +89,7 @@ def test_boots_polls_routes_updates_and_stops_cleanly():
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            **kwargs,
         )
 
         assert _wait_for_port(health_port), "health endpoint never bound $PORT"
@@ -116,13 +121,16 @@ def test_boots_polls_routes_updates_and_stops_cleanly():
         # The join button press was acknowledged.
         assert "answerCallbackQuery" in calls, calls
 
-        bot.send_signal(signal.SIGTERM)
-        stdout, _ = bot.communicate(timeout=45)
         if sys.platform == "win32":
-            assert bot.returncode in (0, 1, 15), stdout
+            bot.send_signal(signal.CTRL_BREAK_EVENT)
+            stdout, _ = bot.communicate(timeout=45)
+            assert bot.returncode in (0, 1, 3221225786), stdout
         else:
+            bot.send_signal(signal.SIGTERM)
+            stdout, _ = bot.communicate(timeout=45)
             assert bot.returncode == 0, stdout
             assert "shutting down" in stdout
+        assert "authenticated as @stubbot" in stdout
     finally:
         for proc in (bot, stub):
             if proc is not None and proc.poll() is None:

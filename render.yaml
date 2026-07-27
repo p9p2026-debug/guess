@@ -18,7 +18,5 @@ services:
         sync: false
       - key: PYTHON_VERSION
         value: "3.13.4"
-      - key: ROUND_SECONDS
-        value: "300"
       - key: LOG_LEVEL
         value: "INFO"
