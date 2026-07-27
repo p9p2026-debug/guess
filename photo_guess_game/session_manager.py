@@ -82,7 +82,7 @@ class SessionManager:
         self, group_chat_id: int, host_id: int, host_name: str
     ) -> OperationResult:
         existing = self._store.get(group_chat_id)
-        if existing is not None and existing.state in _ACTIVE_STATES:
+        if existing is not None and existing.state == GameState.GUESSING:
             return OperationResult(
                 ok=False, reason="session_already_active", session=existing
             )
@@ -96,6 +96,7 @@ class SessionManager:
             created_at=time.time(),
         )
         self._store.put(session)
+
 
         announcement = Notification(
             channel="group",
