@@ -138,6 +138,9 @@ class TelegramAdapter:
                     {"text": "🚀 بدء اللعبة", "callback_data": "start_game"},
                     {"text": "❌ إلغاء اللعبة", "callback_data": "cancel_game"},
                 ],
+                [
+                    {"text": "📌 أظهر لوحة الأزرار بالأسفل", "callback_data": "refresh_panel"},
+                ],
             ]
             return Notification(channel="group", target_id=group_chat_id, text=text, buttons=buttons)
 
@@ -146,7 +149,7 @@ class TelegramAdapter:
             vote_buttons = [
                 [{"text": f"👤 {p.display_name}", "callback_data": f"vote:{pid}"}]
                 for pid, p in session.players.items()
-            ]
+            ] + [[{"text": "📌 أظهر لوحة الأزرار بالأسفل", "callback_data": "refresh_panel"}]]
             voted_count = len(session.votes)
             total_players = len(session.players)
             text = (
@@ -160,6 +163,7 @@ class TelegramAdapter:
             spy_buttons = [
                 [{"text": "🗳️ بدء التصويت على الجاسوس", "callback_data": "start_voting"}],
                 [{"text": "💡 تخمين الكلمة السرية (الجاسوس)", "callback_data": "spy_guess_menu"}],
+                [{"text": "📌 أظهر لوحة الأزرار بالأسفل", "callback_data": "refresh_panel"}],
             ]
             text = (
                 f"{prefix_text}\n\n"

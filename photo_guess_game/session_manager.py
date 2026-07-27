@@ -33,7 +33,11 @@ _LOBBY_BUTTONS: list[list[dict[str, str]]] = [
         {"text": "🚀 بدء اللعبة", "callback_data": "start_game"},
         {"text": "❌ إلغاء اللعبة", "callback_data": "cancel_game"},
     ],
+    [
+        {"text": "📌 أظهر لوحة الأزرار بالأسفل", "callback_data": "refresh_panel"},
+    ],
 ]
+
 
 
 _TURN_BUTTONS: list[list[dict[str, str]]] = [

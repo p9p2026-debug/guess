@@ -101,17 +101,22 @@ class TelegramBotRunner:
             print(f"[Error sending photo to {target_id}]: {err}", file=sys.stderr)
 
     async def answer_callback_query(
-        self, callback_query_id: str, text: str = ""
+        self, callback_query_id: str, text: str = "", show_alert: bool = False
     ) -> None:
         if self.client is None:
             return
         try:
-            payload = {"callback_query_id": callback_query_id, "text": text}
+            payload = {
+                "callback_query_id": callback_query_id,
+                "text": text,
+                "show_alert": show_alert,
+            }
             await self.client.post(
                 f"{self.base_url}/answerCallbackQuery", json=payload, timeout=10.0
             )
         except Exception as err:
             print(f"[Error answering callback query]: {err}", file=sys.stderr)
+
 
     async def run(self) -> None:
         async with httpx.AsyncClient(timeout=35.0) as client:
@@ -172,69 +177,56 @@ class TelegramBotRunner:
 
             if data == "start_voting" and chat_id:
                 res = await self.adapter.handle_start_voting(group_chat_id=chat_id)
-                await self.answer_callback_query(cb_id, text="بدأ التصويت! 🗳️")
+                await self.answer_callback_query(cb_id, text="تم فتح باب التصويت في المجموعة! 🗳️", show_alert=True)
             elif data.startswith("vote:") and chat_id:
                 target_id = int(data.split(":", 1)[1])
                 res = await self.adapter.handle_spy_vote(
                     group_chat_id=chat_id, voter_id=user_id, target_id=target_id
                 )
-                await self.answer_callback_query(cb_id, text="تم تسجيل صوتك! 🗳️")
+                toast = "تم تسجيل صوتك بنجاح! 🗳️" if res.ok else "لقد قمت بالتصويت مسبقاً! ⚠️"
+                await self.answer_callback_query(cb_id, text=toast, show_alert=True)
             elif data == "spy_guess_menu" and chat_id:
                 res = await self.adapter.handle_spy_guess_menu(
                     group_chat_id=chat_id, user_id=user_id
                 )
-                toast = "قائمة التخمين للجاسوس 💡" if res.ok else "مخصص للجاسوس فقط! ⚠️"
-                await self.answer_callback_query(cb_id, text=toast)
+                toast = "اختر التخمين الصحيح للموقع من الأزرار! 💡" if res.ok else "عذراً! هذا الزر مخصص للجاسوس فقط ⚠️"
+                await self.answer_callback_query(cb_id, text=toast, show_alert=True)
             elif data.startswith("spy_guess:") and chat_id:
                 word_guess = data.split(":", 1)[1]
                 res = await self.adapter.handle_spy_guess(
                     group_chat_id=chat_id, spy_id=user_id, word_guess=word_guess
                 )
-                await self.answer_callback_query(cb_id, text=f"تم تخمين: {word_guess}")
-            elif data == "answer:yes" and chat_id:
-                res = await self.adapter.handle_answer(
-                    group_chat_id=chat_id, responder_id=user_id, answer_type="yes"
-                )
-                await self.answer_callback_query(cb_id, text="تم تسجيل إجابة: 🟢 نعم")
-            elif data == "answer:no" and chat_id:
-                res = await self.adapter.handle_answer(
-                    group_chat_id=chat_id, responder_id=user_id, answer_type="no"
-                )
-                await self.answer_callback_query(cb_id, text="تم تسجيل إجابة: 🔴 لا")
-            elif data == "guess_intent" and chat_id:
-                res = await self.adapter.handle_guess_intent(
-                    group_chat_id=chat_id, user_id=user_id
-                )
-                await self.answer_callback_query(cb_id, text="🎯 أرسل تخمينك بـ /guess الكلمة")
+                await self.answer_callback_query(cb_id, text=f"تم إرسال تخمينك: {word_guess}", show_alert=True)
             elif data == "join_game" and chat_id:
                 res = await self.adapter.handle_join(
                     group_chat_id=chat_id, user_id=user_id, display_name=display_name
                 )
-                toast = "تم الانضمام للعبة! 👥" if res.ok else (
-                    "أنت منضم مسبقاً!" if res.reason == "already_member"
-                    else "اللوبي ممتلئ!" if res.reason == "lobby_full"
-                    else "تعذر الانضمام."
+                toast = "تم انضمامك بنجاح! 👥" if res.ok else (
+                    "أنت منضم لهذه اللعبة بالفعل! ✅" if res.reason == "already_member"
+                    else "اللوبي ممتلئ بحده الأقصى! ⚠️" if res.reason == "lobby_full"
+                    else "لا توجد لعبة مفتوحة للانضمام حالياً."
                 )
-                await self.answer_callback_query(cb_id, text=toast)
-
-
+                await self.answer_callback_query(cb_id, text=toast, show_alert=True)
             elif data == "leave_game" and chat_id:
                 res = await self.adapter.handle_leave(group_chat_id=chat_id, user_id=user_id)
-                toast = "تم مغادرة اللعبة!" if res.ok else "أنت لست في اللعبة."
-                await self.answer_callback_query(cb_id, text=toast)
+                toast = "تمت مغادرتك للعبة! 🚪" if res.ok else "أنت لست مشاركاً في اللعبة."
+                await self.answer_callback_query(cb_id, text=toast, show_alert=True)
             elif data == "start_game" and chat_id:
                 res = await self.adapter.handle_startgame(group_chat_id=chat_id, user_id=user_id)
-                toast = "جاري بدء اللعبة... ⏱️" if res.ok else (
-                    "فقط منشئ اللعبة يمكنه البدء!" if res.reason == "not_host"
-                    else "عدد اللاعبين غير كافٍ!" if res.reason == "below_minimum"
-                    else "هناك لاعبون لم يرسلوا صورهم!" if res.reason == "missing_photos"
+                toast = "🚀 بدأت اللعبة وتم توزيع الكلمات بالخاص!" if res.ok else (
+                    "عذراً! فقط منشئ اللعبة (Host) يمكنه البدء ⚠️" if res.reason == "not_host"
+                    else "يلزم وجود لاعبَين اثنين على الأقل لبدء اللعبة! ⚠️" if res.reason == "below_minimum"
                     else "تعذر بدء اللعبة."
                 )
-                await self.answer_callback_query(cb_id, text=toast)
+                await self.answer_callback_query(cb_id, text=toast, show_alert=True)
             elif data == "cancel_game" and chat_id:
                 res = await self.adapter.handle_cancelgame(group_chat_id=chat_id, user_id=user_id)
-                toast = "تم إلغاء اللعبة!" if res.ok else "فقط منشئ اللعبة يمكنه الإلغاء!"
-                await self.answer_callback_query(cb_id, text=toast)
+                toast = "تم إلغاء اللعبة! ❌" if res.ok else "عذراً! فقط منشئ اللعبة يمكنه إلغاء اللعبة ⚠️"
+                await self.answer_callback_query(cb_id, text=toast, show_alert=True)
+            elif data == "refresh_panel" and chat_id:
+                await self.adapter.handle_status(group_chat_id=chat_id)
+                await self.answer_callback_query(cb_id, text="تم إظهار لوحة التحكم بالأسفل! 📌", show_alert=False)
+
             elif data.startswith("guess:"):
                 parts = data.split(":", 2)
                 if len(parts) == 3:
