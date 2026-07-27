@@ -18,43 +18,35 @@ BOT_TOKEN = os.environ.get(
 )
 
 
-HELP_GUIDE_HTML = """<b>🎮 دليل لعبة تخمين الصور (Hedbanz / Heads Up) 📸</b>
+HELP_GUIDE_HTML = """<b>🕵️‍♂️ دليل لعبة الجاسوس والكلمة السرية (Telegram Spy Game) 💬</b>
 
 <blockquote expandable>
 <b>💡 فكرة اللعبة:</b>
-لعبة جماعية ممتعة تلعبها مع أصدقائك في مجموعات التيليجرام! يقوم كل لاعب برفع صوره الخاصة للبوت بالسرية، ثم يوزع البوت الصور على الجميع بأسماء مستعارة (مثل <code>Photo A</code>, <code>Photo B</code>). هدفك هو التخمين من صاحب كل صورة وكسب النقاط!
+لعبة ذكاء وتمويه جماعية ممتعة! يرسل البوت موقعاً سرياً واحداً بالخاص لجميع اللاعبين (مثل: 🏥 مستشفى / ✈️ مطار / 🍕 مطعم)، ولكنه يختار <b>لاعباً واحداً ليكون الجاسوس 🕵️</b> (لا يعرف الكلمة السرية!).
+
+<b>🎯 الأهداف وظروف الفوز:</b>
+• 👥 <b>المواطنون:</b> طرح أسئلة ذكية في المجموعة لكشف الجاسوس وطرد بالتصويت قبل أن يعرف الكلمة السرية!
+• 🕵️ <b>الجاسوس:</b> التظاهر بأنك تعرف الكلمة السرية، الاستماع لأسئلة المنافسين بذكاء لاكتشاف المكان السري، أو إقناع الجميع بطرد مواطن بريء!
+
+<b>📋 خطوات اللعب:</b>
+1️⃣ أرسل <code>/newgame</code> واضغط <b>➕ انضمام للعبة</b> في المجموعة.
+2️⃣ يرسل البوت الكلمة السرية بالخاص لجميع المواطنين (ويرسل للجاسوس تنبيه أنه هو الجاسوس).
+3️⃣ تبدأ الأسئلة والتحقيق المباشر في المجموعة (مثال: "هل تزور هذا المكان بالليل؟" / "هل تلبس ملابس معينة هناك؟").
+4️⃣ اضغط <b>🗳️ بدء التصويت على الجاسوس</b> واصوت على المشتبه به بضغطة زر واحدة!
+5️⃣ إذا تم طرد الجاسوس، يحصل الجاسوس على فرصة أخيرة لتخمين المكان والفوز!
 </blockquote>
 
-<b>📋 خطوات اللعب وسير الجولة:</b>
-
-<b>1️⃣ فتح اللوبي:</b> أرسل <code>/newgame</code> في المجموعة أو اضغط على زر <b>➕ Join Game</b>.
-<b>2️⃣ إرسال الصور:</b> يدخل كل لاعب في المحادثة الخاصة مع البوت <b>@guessJobot</b> ويرسل صورته بالسرية.
-<b>3️⃣ بدء اللعبة:</b> يقوم منشئ اللعبة (Host) بالضغط على زر <b>🚀 Start Game</b>.
-<b>4️⃣ مرحلة التخمين:</b> تصلك صور باقي اللاعبين في الخاص مرفقة بأزرار فيها أسماء اللاعبين. اضغط على زر اسم اللاعب لتسجيل تخمينك!
-<b>5️⃣ إعلان النتائج والترتيب:</b> عند انتهاء الوقت، يظهر كشف الأسرار ولوحة الترتيب النهائية في المجموعة!
-
-<b>📊 نظام النقاط وحساب الترتيب:</b>
-
+<b>📊 جدول خيارات الفوز والحسم:</b>
 <pre>
-┌───────────────────┬────────┐
-│ النتيجة           │ النقاط │
-├───────────────────┼────────┤
-│ تخمين صحيح        │  +1    │
-│ تخمين خاطئ        │   0    │
-│ عدم التخمين       │   0    │
-└───────────────────┴────────┘
-</pre>
+┌─────────────────────────┬─────────────────┐
+│ النتيجة                 │ الفائز باللعبة  │
+├─────────────────────────┼─────────────────┤
+│ طرد مواطن بريء          │  🕵️ الجاسوس     │
+│ طرد الجاسوس + تخمين صح  │  🕵️ الجاسوس     │
+│ طرد الجاسوس + تخمين خطأ │  👥 المواطنون   │
+└─────────────────────────┴─────────────────┘
+</pre>"""
 
-<b>⚡ الأزرار التفاعلية والتحكم:</b>
-• <b>➕ Join Game</b> — الانضمام للعبة
-• <b>🚪 Leave Game</b> — المغادرة
-• <b>🚀 Start Game</b> — بدء الجولة (لـ Host)
-• <b>⚙️ /settimeout</b> — ضبط وقت التخمين بالدقائق
-
-<b>💬 نصيحة للنصر:</b>
-<blockquote>
-ناقش أصدقاءك في المجموعة واسألهم أسئلة ذكية لتكشف صاحب كل صورة!
-</blockquote>"""
 
 
 class TelegramBotRunner:
@@ -287,22 +279,10 @@ class TelegramBotRunner:
         if not chat_id or not user_id:
             return
 
-        # Direct Message handling
+        # Direct Message handling (Private chat)
         if chat_type == "private":
-            photos = message.get("photo")
-            if photos and isinstance(photos, list):
-                best_photo = max(photos, key=lambda p: p.get("file_size", 0))
-                file_id = best_photo.get("file_id")
-                if file_id:
-                    await self.adapter.handle_dm_photo(
-                        user_id=user_id, file_id=file_id
-                    )
-                return
-
-            text = message.get("text", "")
-            if text and not text.startswith("/"):
-                await self.adapter.handle_dm_text_reply(user_id=user_id, text=text)
-                return
+            await self.send_message(user_id, HELP_GUIDE_HTML, parse_mode="HTML")
+            return
 
         # Group chat command handling
         text = message.get("text", "")
@@ -318,12 +298,10 @@ class TelegramBotRunner:
             return
 
         if cmd_part in ("/newgame", "/start"):
-            if chat_type == "private" and cmd_part == "/start":
-                await self.send_message(user_id, HELP_GUIDE_HTML, parse_mode="HTML")
-                return
             await self.adapter.handle_newgame(
                 group_chat_id=chat_id, user_id=user_id, display_name=display_name
             )
+
         elif cmd_part == "/join":
             await self.adapter.handle_join(
                 group_chat_id=chat_id, user_id=user_id, display_name=display_name
